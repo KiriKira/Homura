@@ -1253,6 +1253,25 @@ class GatewayService : Service() {
         startGateway(Intent(this, GatewayService::class.java).setAction(ACTION_START))
     }
 
+    private val voiceRestoreAttempts = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * The server could not be asked whether it offers call control, typically
+     * right after Android restarted this process and before the network or the
+     * node was back. Without a retry the gateway kept syncing SMS but took no
+     * calls until someone opened it, so try again with backoff.
+     */
+    private fun scheduleVoiceRestoreRetry() {
+        val attempt = voiceRestoreAttempts.getAndIncrement()
+        val delay = (VOICE_RESTORE_FIRST_DELAY_MS shl attempt.coerceAtMost(5)).coerceAtMost(VOICE_RESTORE_MAX_DELAY_MS)
+        broadcastLog("VOICE: retrying voice start in ${delay / 1000} s")
+        runCatching {
+            wakeRetryScheduler.schedule({
+                android.os.Handler(android.os.Looper.getMainLooper()).post { if (!stopped) restoreVoiceIfReady() }
+            }, delay, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+    }
+
     private fun startGateway(intent: Intent?) {
         val paired=CredentialStore.load(this)
         if(paired==null || (!stopped && orchestrator!=null)){startGatewayConfigured(intent);return}
@@ -1266,7 +1285,7 @@ class GatewayService : Service() {
                 if(generation!=initGeneration.get())return@post
                 initializing.set(false)
                 when {
-                    result.getOrNull() == true -> startGatewayConfigured(intent)
+                    result.getOrNull() == true -> { voiceRestoreAttempts.set(0); startGatewayConfigured(intent) }
                     result.isSuccess -> {
                         broadcastLog("VOICE: server does not offer RTC call control; no voice runtime started")
                         broadcastStatus("ERROR","Server has no call control")
@@ -1276,6 +1295,7 @@ class GatewayService : Service() {
                         broadcastLog("VOICE: server capability unavailable; no voice runtime started")
                         broadcastStatus("ERROR","Voice capability unavailable")
                         startControlGateway()
+                        scheduleVoiceRestoreRetry()
                     }
                 }
             }
@@ -1934,6 +1954,9 @@ class GatewayService : Service() {
     }
 
     companion object {
+        private const val VOICE_RESTORE_FIRST_DELAY_MS = 15_000L
+        private const val VOICE_RESTORE_MAX_DELAY_MS = 5 * 60_000L
+
         /** In-process instrumentation dependency injection; no IPC/config switch
          * exposes synthetic cellular hardware to an installed application. */
         internal var orchestratorFactoryForInstrumentation: ((GatewayService) -> CallOrchestrator)? = null
