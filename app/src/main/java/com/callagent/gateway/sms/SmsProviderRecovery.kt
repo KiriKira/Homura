@@ -251,11 +251,13 @@ object SmsProviderRecovery {
                 reconciliationTargetMaxId = maximumAtEnable
             ) ?: return Status(State.STALE_SCOPE, configured = false, sessionScope = scope)
             checkpoint.toStatus(State.READY)
-        } catch (_: SecurityException) {
+        } catch (e: SecurityException) {
+            android.util.Log.w("SmsRecovery", "SMS provider refused the inbox read", e)
             Status(State.PERMISSION_REQUIRED, configured = false, sessionScope = scope)
         } catch (e: Exception) {
+            android.util.Log.w("SmsRecovery", "Could not enable SMS recovery", e)
             Status(State.PROVIDER_UNAVAILABLE, configured = false, sessionScope = scope,
-                detail = e.javaClass.simpleName)
+                detail = listOfNotNull(e.javaClass.simpleName, e.message?.take(120)).joinToString(": "))
         }
     }
 
