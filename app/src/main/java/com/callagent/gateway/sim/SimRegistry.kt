@@ -75,13 +75,25 @@ object SimRegistry {
             observed: String?
         ): Boolean = identityState == IdentityState.LOCAL_CONFIRMED && pinned == null && observed != null
 
+        /**
+         * A confirmation without an ICCID fingerprint lasts for this boot, or
+         * across boots while the same subscription record is still present
+         * ([sameSubscription]): Android keys subscription records by ICCID, so
+         * a swapped card shows up as another subscription.
+         */
         fun localConfirmationExpired(
             identityState: IdentityState,
             currentlyObservedFingerprint: String?,
             confirmedBootCount: Int?,
-            currentBootCount: Int?
+            currentBootCount: Int?,
+            sameSubscription: Boolean = false
         ): Boolean = identityState == IdentityState.LOCAL_CONFIRMED && currentlyObservedFingerprint == null &&
+            !sameSubscription &&
             (confirmedBootCount == null || currentBootCount == null || confirmedBootCount != currentBootCount)
+
+        /** The subscription identity recorded at confirmation is the one present now. */
+        fun sameSubscription(recorded: String?, observed: String?): Boolean =
+            recorded != null && recorded == observed
 
         fun canUseSingleConfirmation(
             currentRevision: Long,
@@ -178,7 +190,14 @@ object SimRegistry {
         /** Used only for LOCAL_CONFIRMED mappings without an ICCID fingerprint. */
         var confirmedBootCount: Int?,
         /** Opaque account handle key; never parsed to infer a subscription. */
-        var accountHandleKey: String?
+        var accountHandleKey: String?,
+        /**
+         * Salted hash of what an unprivileged app can read about the
+         * subscription (id, carrier id, MCC/MNC). Keeps a binding verified
+         * when the ICCID cannot be read: without root, after a reboot, or in
+         * a process that lacks the privilege another one had.
+         */
+        var subscriptionToken: String? = null
     )
 
     private data class RegistryState(
@@ -193,7 +212,8 @@ object SimRegistry {
     private data class CurrentSubscription(
         val info: SubscriptionInfo,
         val fingerprint: String?,
-        val phoneAccountHandle: PhoneAccountHandle?
+        val phoneAccountHandle: PhoneAccountHandle?,
+        val subscriptionToken: String
     )
 
     /** Read current subscriptions and local mappings; voice accounts are opt-in. */
@@ -386,7 +406,8 @@ object SimRegistry {
             fingerprint = selected.fingerprint ?: existing?.fingerprint,
             identityState = identityState,
             confirmedBootCount = if (selected.fingerprint == null) readBootCount(appContext) else null,
-            accountHandleKey = currentAccountKey ?: existing?.accountHandleKey
+            accountHandleKey = currentAccountKey ?: existing?.accountHandleKey,
+            subscriptionToken = selected.subscriptionToken
         )
         persist(appContext, state)
         mappingFor(state, state.mappings.getValue(canonicalSimId), selected)
@@ -451,7 +472,8 @@ object SimRegistry {
                 fingerprint = selected.fingerprint ?: prior?.fingerprint,
                 identityState = if (selected.fingerprint != null) IdentityState.FINGERPRINT_VERIFIED else IdentityState.LOCAL_CONFIRMED,
                 confirmedBootCount = if (selected.fingerprint == null) readBootCount(appContext) else null,
-                accountHandleKey = accountKey ?: prior?.accountHandleKey
+                accountHandleKey = accountKey ?: prior?.accountHandleKey,
+                subscriptionToken = selected.subscriptionToken
             ) to selected
         }
         state.mappingRevision = serverRevision
@@ -572,7 +594,8 @@ object SimRegistry {
                         stored.identityState, stored.fingerprint, subscription.fingerprint
                     ) ||
                     (stored.identityState == IdentityState.FINGERPRINT_VERIFIED &&
-                        stored.fingerprint != null && subscription.fingerprint == null) ||
+                        stored.fingerprint != null && subscription.fingerprint == null &&
+                        !Policy.sameSubscription(stored.subscriptionToken, subscription.subscriptionToken)) ||
                     (stored.accountHandleKey != null && subscriptionAccountKey != null &&
                         stored.accountHandleKey != subscriptionAccountKey)
                 if (identityChanged && stored.identityState != IdentityState.UNVERIFIED) {
@@ -662,23 +685,34 @@ object SimRegistry {
             }
             val slotChanged = active.info.simSlotIndex != stored.slotIndex
             val fingerprintMismatch = Policy.fingerprintMismatch(stored.fingerprint, active.fingerprint)
-            // A missing fingerprint requires a new local confirmation after a
-            // fingerprint-based binding. A prior LOCAL_CONFIRMED binding is
-            // already the explicit fallback for devices that cannot expose it.
+            val sameSubscription = Policy.sameSubscription(stored.subscriptionToken, active.subscriptionToken)
+            // A missing fingerprint after a fingerprint-based binding needs a new
+            // local confirmation, unless the subscription recorded with it is
+            // still the one present (the ICCID just cannot be read here). A
+            // prior LOCAL_CONFIRMED binding is the explicit fallback for
+            // devices that cannot expose it.
             val fingerprintUnavailable = stored.fingerprint != null && active.fingerprint == null &&
-                stored.identityState == IdentityState.FINGERPRINT_VERIFIED
+                stored.identityState == IdentityState.FINGERPRINT_VERIFIED && !sameSubscription
             val handleKey = active.phoneAccountHandle?.let(::accountHandleKey)
             val accountChanged = stored.accountHandleKey != null && handleKey != null &&
                 stored.accountHandleKey != handleKey
             val currentBootCount = readBootCount(context)
             val localConfirmationExpired = Policy.localConfirmationExpired(
-                stored.identityState, active.fingerprint, stored.confirmedBootCount, currentBootCount
+                stored.identityState, active.fingerprint, stored.confirmedBootCount, currentBootCount, sameSubscription
             )
 
             if (slotChanged || fingerprintMismatch || fingerprintUnavailable || accountChanged || localConfirmationExpired) {
                 if (stored.identityState != IdentityState.UNVERIFIED) bumpLocalBarrier(state)
                 stored.identityState = IdentityState.UNVERIFIED
-            } else if (Policy.newFingerprintNeedsConfirmation(
+            } else if (stored.subscriptionToken != active.subscriptionToken &&
+                stored.identityState != IdentityState.UNVERIFIED &&
+                (stored.subscriptionToken == null || active.fingerprint != null && active.fingerprint == stored.fingerprint)) {
+                // Still verified by this boot's confirmation or a matching
+                // ICCID: record the subscription now (bindings confirmed
+                // before it was recorded, or a carrier id that changed).
+                stored.subscriptionToken = active.subscriptionToken
+            }
+            if (stored.identityState != IdentityState.UNVERIFIED && Policy.newFingerprintNeedsConfirmation(
                     stored.identityState, stored.fingerprint, active.fingerprint
                 )) {
                 // A newly readable ICCID cannot prove that this is the same
@@ -715,7 +749,8 @@ object SimRegistry {
             CurrentSubscription(
                 info = info,
                 fingerprint = fingerprint(info, salt),
-                phoneAccountHandle = voiceHandles[info.subscriptionId]
+                phoneAccountHandle = voiceHandles[info.subscriptionId],
+                subscriptionToken = subscriptionToken(info, salt)
             )
         }
     }
@@ -799,6 +834,18 @@ object SimRegistry {
         return bytes.joinToString("") { byte -> "%02x".format(byte) }
     }
 
+    /** What any app with READ_PHONE_STATE reads about a subscription, salted like the fingerprint. */
+    @Suppress("DEPRECATION")
+    private fun subscriptionToken(info: SubscriptionInfo, salt: ByteArray): String {
+        val carrierId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) info.carrierId else -1
+        val mcc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) info.mccString.orEmpty() else info.mcc.toString()
+        val mnc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) info.mncString.orEmpty() else info.mnc.toString()
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(salt)
+        val bytes = digest.digest("subscription-v1|${info.subscriptionId}|$carrierId|$mcc|$mnc".toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { byte -> "%02x".format(byte) }
+    }
+
     private fun accountHandleKey(handle: PhoneAccountHandle): String =
         "${handle.componentName.flattenToString()}|${handle.id}"
 
@@ -848,7 +895,8 @@ object SimRegistry {
                     fingerprint = item.optString("fingerprint").takeIf { it.isNotEmpty() },
                     identityState = IdentityState.valueOf(item.getString("identity_state")),
                     confirmedBootCount = item.optInt("confirmed_boot_count", -1).takeIf { it >= 0 },
-                    accountHandleKey = item.optString("phone_account").takeIf { it.isNotEmpty() }
+                    accountHandleKey = item.optString("phone_account").takeIf { it.isNotEmpty() },
+                    subscriptionToken = item.optString("subscription_token").takeIf { it.isNotEmpty() }
                 )
                 if (mappings.put(simId, mapping) != null) {
                     throw IllegalArgumentException("Duplicate sim_id")
@@ -880,6 +928,7 @@ object SimRegistry {
                 put("identity_state", mapping.identityState.name)
                 put("confirmed_boot_count", mapping.confirmedBootCount ?: -1)
                 put("phone_account", mapping.accountHandleKey ?: "")
+                put("subscription_token", mapping.subscriptionToken ?: "")
             })
         }
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
