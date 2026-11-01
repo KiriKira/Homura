@@ -2294,9 +2294,23 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 renderSmsSettings()
                 if (result.configured) scanSmsRecovery()
-                else Toast.makeText(this, "短信补收未启用，请检查权限及配对状态", Toast.LENGTH_LONG).show()
+                else {
+                    appendLog("WARN: SMS recovery not enabled: ${result.state}${result.detail?.let { " ($it)" }.orEmpty()}")
+                    Toast.makeText(this, smsRecoveryFailureText(result), Toast.LENGTH_LONG).show()
+                }
             }
         }, "sms-recovery-configure").start()
+    }
+
+    private fun smsRecoveryFailureText(result: SmsProviderRecovery.Status): String = when (result.state) {
+        SmsProviderRecovery.State.NOT_PAIRED -> "短信补收未启用：请先配对中转服务器"
+        SmsProviderRecovery.State.PERMISSION_REQUIRED ->
+            "短信补收未启用：系统拒绝读取短信。请在应用信息里允许“短信”权限；部分系统还需在权限管理中允许“读取短信”"
+        SmsProviderRecovery.State.STALE_SCOPE ->
+            "短信补收未启用：本机保存的配对与网关数据不一致。请重启网关服务后再试，仍不行请重新配对"
+        SmsProviderRecovery.State.PROVIDER_UNAVAILABLE ->
+            "短信补收未启用：无法读取系统短信库（${result.detail ?: "未知错误"}），详情见运行日志"
+        else -> "短信补收未启用（${result.state}），详情见运行日志"
     }
 
     private fun scanSmsRecovery() {
