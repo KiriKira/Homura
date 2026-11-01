@@ -392,7 +392,8 @@ object SmsProviderRecovery {
         lastOutcome = lastOutcome
     )
 
-    private class ContentResolverInboxSource(context: Context) : InboxSource {
+    /** Reads the system inbox; internal so tests can drive it through a real provider. */
+    internal class ContentResolverInboxSource(context: Context) : InboxSource {
         private val resolver = context.applicationContext.contentResolver
         private val inboxUri: Uri = Telephony.Sms.Inbox.CONTENT_URI
 
@@ -401,8 +402,9 @@ object SmsProviderRecovery {
                 putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "type=?")
                 putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
                     arrayOf(Telephony.Sms.MESSAGE_TYPE_INBOX.toString()))
-                putStringArrayList(ContentResolver.QUERY_ARG_SORT_COLUMNS, arrayListOf(Telephony.Sms._ID))
-                putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_DESCENDING)
+                // The SMS provider only has the legacy query, which takes a SQL
+                // sort order; QUERY_ARG_SORT_COLUMNS must be a String[] there.
+                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${Telephony.Sms._ID} DESC")
                 putInt(ContentResolver.QUERY_ARG_LIMIT, 1)
             }
             return resolver.query(inboxUri, arrayOf(Telephony.Sms._ID), args, null)?.use { cursor ->
@@ -431,8 +433,7 @@ object SmsProviderRecovery {
             val args = Bundle().apply {
                 putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
                 putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
-                putStringArrayList(ContentResolver.QUERY_ARG_SORT_COLUMNS, arrayListOf(Telephony.Sms._ID))
-                putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_ASCENDING)
+                putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${Telephony.Sms._ID} ASC")
                 putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
             }
             val extendedProjection = arrayOf(
