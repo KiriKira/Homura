@@ -102,13 +102,13 @@ class SmsProviderRecoveryTest {
         // left for the incremental high-water scan after the bounded sweep.
         source.rows = source.rows + providerRow(3, "same text", receivedAt, "+15550001111")
 
-        val twoMatches = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 10)
+        val twoMatches = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 10 + SmsProviderRecovery.BROADCAST_GRACE_MS)
         assertEquals(SmsProviderRecovery.State.COMPLETE, twoMatches.state)
         assertEquals(0, twoMatches.matchedBroadcasts)
         assertEquals(2, twoMatches.importedRows)
         assertEquals(4, receivedEventCount())
 
-        val thirdMessage = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 20)
+        val thirdMessage = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 20 + SmsProviderRecovery.BROADCAST_GRACE_MS)
         assertEquals(1, thirdMessage.importedRows)
         assertEquals(0, thirdMessage.duplicateRows)
         assertEquals(5, receivedEventCount())
@@ -133,11 +133,89 @@ class SmsProviderRecoveryTest {
         SmsProviderRecovery.configureForTest(
             context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, receivedAt
         )
-        val result = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 1)
+        val result = SmsProviderRecovery.scanForTest(context, session, source, 10, receivedAt + 1 + SmsProviderRecovery.BROADCAST_GRACE_MS)
 
         assertEquals(1, result.matchedBroadcasts)
         assertEquals(0, result.importedRows)
         assertEquals(1, receivedEventCount())
+    }
+
+    @Test
+    fun broadcastMatchesOnTheNetworkTimestampWhenDeliveryWasLate() {
+        // The broadcast path records the PDU's service-centre time; the
+        // provider keeps that as date_sent and its own receive time as date.
+        val networkAt = 5_000_000L
+        val phoneAt = networkAt + 3 * 60_000L
+        database.recordIncomingSms(
+            messageId = UUID.randomUUID().toString(), sender = "+15550001111", recipient = "",
+            body = "late text", receivedAt = networkAt, partCount = 1, subId = -1,
+            slotIndex = -1, simId = null, mappingRevision = null, resolution = "unknown"
+        )
+        val source = FakeInbox(listOf(providerRow(1, "late text", phoneAt, "+15550001111", dateSent = networkAt)))
+        SmsProviderRecovery.configureForTest(
+            context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, phoneAt
+        )
+        val result = SmsProviderRecovery.scanForTest(
+            context, session, source, 10, phoneAt + SmsProviderRecovery.BROADCAST_GRACE_MS
+        )
+
+        assertEquals(1, result.matchedBroadcasts)
+        assertEquals(0, result.importedRows)
+        assertEquals(1, receivedEventCount())
+    }
+
+    @Test
+    fun anEarlierIdenticalBroadcastOutsideTheWindowDoesNotMakeTheMatchAmbiguous() {
+        // A sender repeating the same text: yesterday's copy must not count
+        // as a candidate for today's, or the match is ambiguous and recovery
+        // uploads a second copy of today's message.
+        val today = 7_000_000_000L
+        listOf(today - 24 * 3_600_000L, today).forEach { at ->
+            database.recordIncomingSms(
+                messageId = UUID.randomUUID().toString(), sender = "+15550001111", recipient = "",
+                body = "repeated notice", receivedAt = at, partCount = 1, subId = -1,
+                slotIndex = -1, simId = null, mappingRevision = null, resolution = "unknown"
+            )
+        }
+        val source = FakeInbox(listOf(providerRow(1, "repeated notice", today + 2_000L, "+15550001111", dateSent = today)))
+        SmsProviderRecovery.configureForTest(
+            context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, today
+        )
+        val result = SmsProviderRecovery.scanForTest(
+            context, session, source, 10, today + SmsProviderRecovery.BROADCAST_GRACE_MS + 2_000L
+        )
+
+        assertEquals(1, result.matchedBroadcasts)
+        assertEquals(0, result.importedRows)
+        assertEquals(2, receivedEventCount())
+    }
+
+    @Test
+    fun aRowYoungerThanTheBroadcastGraceWaitsForItsBroadcast() {
+        val phoneAt = 6_000_000L
+        val source = FakeInbox(listOf(
+            providerRow(1, "older", phoneAt - 5 * 60_000L),
+            providerRow(2, "fresh", phoneAt, "+15550001111")
+        ))
+        SmsProviderRecovery.configureForTest(
+            context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, phoneAt
+        )
+        val early = SmsProviderRecovery.scanForTest(context, session, source, 10, phoneAt + 5_000L)
+        assertEquals(1, early.importedRows)
+        assertEquals(1, receivedEventCount())
+
+        // The broadcast arrives within the grace period; the later scan matches it.
+        database.recordIncomingSms(
+            messageId = UUID.randomUUID().toString(), sender = "+15550001111", recipient = "",
+            body = "fresh", receivedAt = phoneAt, partCount = 1, subId = -1,
+            slotIndex = -1, simId = null, mappingRevision = null, resolution = "unknown"
+        )
+        val later = SmsProviderRecovery.scanForTest(
+            context, session, source, 10, phoneAt + SmsProviderRecovery.BROADCAST_GRACE_MS
+        )
+        assertEquals(1, later.matchedBroadcasts)
+        assertEquals(0, later.importedRows)
+        assertEquals(2, receivedEventCount())
     }
 
     @Test
@@ -205,9 +283,10 @@ class SmsProviderRecoveryTest {
         id: Long,
         body: String,
         date: Long,
-        sender: String = "+15550002222"
+        sender: String = "+15550002222",
+        dateSent: Long = date
     ) = SmsProviderRecovery.RawRow(
-        rowId = id, sender = sender, body = body, date = date, dateSent = date,
+        rowId = id, sender = sender, body = body, date = date, dateSent = dateSent,
         subscriptionId = -1, serviceCenter = "+15550000001", protocol = 0
     )
 

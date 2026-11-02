@@ -22,6 +22,8 @@ import java.security.MessageDigest
 object SmsProviderRecovery {
     const val MAX_PAGE_SIZE = 120
     const val BROADCAST_MATCH_WINDOW_MS = 10 * 1000L
+    /** How long a new inbox row waits for its broadcast before recovery may import it. */
+    const val BROADCAST_GRACE_MS = 60 * 1000L
     const val RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1000L
 
     enum class HistoryMode { SINCE_ENABLE, FULL_CURRENT_INBOX }
@@ -300,9 +302,14 @@ object SmsProviderRecovery {
                 checkpoint.reconcileRowId else checkpoint.lastRowId
             val targetMax = if (scanMode == GatewayDatabase.SmsProviderScanMode.RECONCILE)
                 checkpoint.reconcileTargetMaxId else null
-            val rawRows = source.page(cursor, checkpoint.minimumProviderId,
+            val fetched = source.page(cursor, checkpoint.minimumProviderId,
                 checkpoint.scanStartAt, pageSize, targetMax)
-            val complete = rawRows.size < pageSize
+            // The system writes the inbox row before it delivers the broadcast.
+            // Leave rows that young for a later round, so the broadcast is
+            // journaled first and the row matches it instead of adding a copy.
+            // Rows are in id order, so stop at the first young one.
+            val rawRows = fetched.takeWhile { it.date <= 0 || now - it.date >= BROADCAST_GRACE_MS }
+            val complete = rawRows.size == fetched.size && fetched.size < pageSize
             val rows = rawRows.map { raw -> toDatabaseRow(context, raw, simSnapshot) }
             val committed = withScanIdentity(context, session, enforceCurrentIdentity) {
                 database.importSmsProviderPage(
@@ -362,7 +369,8 @@ object SmsProviderRecovery {
             recipient = candidate?.phoneNumber.orEmpty(),
             simId = resolved?.simId,
             mappingRevision = resolved?.mappingRevision,
-            resolution = if (resolved != null) "known" else "unknown"
+            resolution = if (resolved != null) "known" else "unknown",
+            sentAt = raw.dateSent
         )
     }
 
