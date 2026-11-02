@@ -80,7 +80,9 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val mappingRevision: Long? = null,
         val resolution: String = "unknown",
         /** Historical recovery cannot safely infer the name of the SIM that was present then. */
-        val simLabel: String? = null
+        val simLabel: String? = null,
+        /** The provider's date_sent: the network timestamp the broadcast path records. */
+        val sentAt: Long = 0L
     )
 
     data class SmsProviderCheckpoint(
@@ -603,6 +605,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     matched++
                     archiveExistingInbox(db, archiveIdentity, eventId)
                 } else {
+                    logUnmatchedProviderRow(db, ownerGatewayId, row)
                     messageId = providerMessageId(ownerGatewayId, sessionScope, row.providerIdentity)
                     eventId = UUID.randomUUID().toString()
                     val at = row.receivedAt.takeIf { it > 0 } ?: now
@@ -677,6 +680,29 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         } finally { db.endTransaction() }
     }
 
+    /**
+     * Why a provider row found no broadcast: counts of nearby broadcasts that
+     * share only its body, only its sender, or both. Counts only, no content.
+     */
+    private fun logUnmatchedProviderRow(db: SQLiteDatabase, ownerGatewayId: String, row: SmsProviderRow) {
+        runCatching {
+            val sentAt = row.sentAt.takeIf { it > 0 } ?: row.receivedAt
+            val near = "(ABS(i.received_at-?)<=CAST(? AS INTEGER) OR ABS(i.received_at-?)<=CAST(? AS INTEGER))"
+            val window = (10 * 60_000L).toString()
+            fun count(match: String, vararg values: String): Int = db.rawQuery(
+                """SELECT COUNT(*) FROM inbox i JOIN events e ON e.event_id=i.event_id
+                    WHERE e.owner_gateway_id=? AND i.source='broadcast' AND $near AND $match""",
+                arrayOf(ownerGatewayId, row.receivedAt.toString(), window, sentAt.toString(), window, *values)
+            ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+            val both = count("i.sender=? AND i.body=?", row.sender, row.body)
+            val bodyOnly = count("i.sender!=? AND i.body=?", row.sender, row.body)
+            val senderOnly = count("i.sender=? AND i.body!=?", row.sender, row.body)
+            android.util.Log.i("SmsRecovery", "Importing an inbox row no broadcast matched; broadcasts within 10 min: " +
+                "same=$both bodyOnly=$bodyOnly senderOnly=$senderOnly sub=${row.subscriptionId} " +
+                "sentSkewMs=${if (row.sentAt > 0) row.receivedAt - row.sentAt else "n/a"}")
+        }
+    }
+
     private fun findBroadcastEvidence(
         db: SQLiteDatabase,
         ownerGatewayId: String,
@@ -686,31 +712,30 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         // These fields are not enough to distinguish messages with an empty
         // body or a missing timestamp; preserve a possible duplicate instead.
         if (row.sender.isBlank() || row.body.isEmpty() || row.receivedAt <= 0) return null
-        val query = if (row.subscriptionId >= 0) {
-            """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
+        // Arguments bind as text and SQLite orders every number before every
+        // text value, so the window must be cast or it always matches.
+        // The broadcast path stores the network (service centre) timestamp from
+        // the PDU, which the provider keeps as date_sent; its date is when the
+        // phone received it. A message the network held back has the two far
+        // apart, so match either one against the broadcast time.
+        val sentAt = row.sentAt.takeIf { it > 0 } ?: row.receivedAt
+        val window = SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString()
+        val subscriptionClause = if (row.subscriptionId >= 0) "AND (i.sub_id<0 OR i.sub_id=?)" else ""
+        val query = """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
                 WHERE e.owner_gateway_id=? AND e.type='sms.received' AND i.source='broadcast'
-                AND i.sender=? AND i.body=? AND ABS(i.received_at-?)<=?
-                AND (i.sub_id<0 OR i.sub_id=?)
+                AND i.sender=? AND i.body=?
+                AND (ABS(i.received_at-?)<=CAST(? AS INTEGER) OR ABS(i.received_at-?)<=CAST(? AS INTEGER))
+                $subscriptionClause
                 AND NOT EXISTS (SELECT 1 FROM sms_provider_imports p
                     WHERE p.owner_gateway_id=? AND p.session_scope=? AND p.event_id=i.event_id)
-                ORDER BY ABS(i.received_at-?),i.received_at,i.event_id LIMIT 2"""
-        } else {
-            """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
-                WHERE e.owner_gateway_id=? AND e.type='sms.received' AND i.source='broadcast'
-                AND i.sender=? AND i.body=? AND ABS(i.received_at-?)<=?
-                AND NOT EXISTS (SELECT 1 FROM sms_provider_imports p
-                    WHERE p.owner_gateway_id=? AND p.session_scope=? AND p.event_id=i.event_id)
-                ORDER BY ABS(i.received_at-?),i.received_at,i.event_id LIMIT 2"""
-        }
-        val args = if (row.subscriptionId >= 0) arrayOf(
-            ownerGatewayId, row.sender, row.body, row.receivedAt.toString(),
-            SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString(), row.subscriptionId.toString(),
-            ownerGatewayId, sessionScope, row.receivedAt.toString()
-        ) else arrayOf(
-            ownerGatewayId, row.sender, row.body, row.receivedAt.toString(),
-            SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString(), ownerGatewayId, sessionScope,
-            row.receivedAt.toString()
-        )
+                ORDER BY MIN(ABS(i.received_at-?),ABS(i.received_at-?)),i.received_at,i.event_id LIMIT 2"""
+        val args = buildList {
+            add(ownerGatewayId); add(row.sender); add(row.body)
+            add(row.receivedAt.toString()); add(window); add(sentAt.toString()); add(window)
+            if (row.subscriptionId >= 0) add(row.subscriptionId.toString())
+            add(ownerGatewayId); add(sessionScope)
+            add(row.receivedAt.toString()); add(sentAt.toString())
+        }.toTypedArray()
         return db.rawQuery(query, args).use { c ->
             if (!c.moveToFirst()) null else {
                 val candidate = c.getString(0) to c.getString(1)
