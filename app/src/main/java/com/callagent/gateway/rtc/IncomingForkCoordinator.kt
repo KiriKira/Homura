@@ -11,11 +11,19 @@ internal fun mayHaveCommittedCreate(error: Throwable): Boolean = when (error) {
     else -> true
 }
 
-/** An incoming call rings the hosts for this long from its first cellular RINGING. */
+/** An incoming call rings the hosts of an older node for this long from its first cellular RINGING. */
 internal const val INCOMING_RING_MS = 25_000L
 
+/**
+ * A node advertising incoming_ring_until_end rings its hosts until the
+ * cellular call ends: the caller hangs up, the network gives up, or a host
+ * declines or answers. This bound, the most the node accepts, only ends a
+ * call whose gateway disappeared.
+ */
+internal const val RING_UNTIL_END_MS = 300_000L
+
 /** What is left of the ring window, on the monotonic clock (elapsedRealtime). */
-fun remainingRingMs(ringStartedAt: Long, now: Long): Long = INCOMING_RING_MS - (now - ringStartedAt)
+fun remainingRingMs(ringStartedAt: Long, now: Long, windowMs: Long = INCOMING_RING_MS): Long = windowMs - (now - ringStartedAt)
 
 /** Coordinates the short window in which one incoming call is being offered
  * sequentially to several RTC nodes. No caller holds this monitor over I/O. */

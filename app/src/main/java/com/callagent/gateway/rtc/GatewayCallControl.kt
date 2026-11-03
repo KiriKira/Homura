@@ -34,6 +34,8 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         /** The node advertises global_decline_v1: a host there can decline a
          * call for every host, which this gateway decides and reports. */
         @Volatile var globalDecline = false
+        /** The node advertises incoming_ring_until_end: its hosts ring until the cellular call ends. */
+        @Volatile var ringUntilEnd = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
         /** The last poll saw a call still being set up: poll at the fast cadence. */
@@ -86,6 +88,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 node.supported=capabilities.optBoolean("rtc_call_control",false)
                 node.receptionV2=capabilities.optBoolean("reception_v2",false)
                 node.globalDecline=capabilities.optBoolean("global_decline_v1",false)
+                node.ringUntilEnd=capabilities.optBoolean("incoming_ring_until_end",false)
                 node.checked=true;node.capabilityAt=now
                 if(!node.supported){node.ready=false;return}
                 check(RtcAudioSession.isAvailable(context)){"RTC_NATIVE_UNAVAILABLE"}
@@ -114,19 +117,24 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
      * failure is left out; an ambiguous response still counts as a possible offer.
      * Once offered, errors end this call; it is never offered a second time.
      * Nodes that take it are told what is left of the ring window, which runs
-     * from ringStartedAt (elapsedRealtime); none is offered after it ends. */
-    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,ringStartedAt:Long,valid:()->Boolean){
+     * from ringStartedAt (elapsedRealtime); none is offered after it ends.
+     * Returns the longest window a node took: how long hosts may still answer. */
+    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,ringStartedAt:Long,valid:()->Boolean):Long{
         val eligible=nodes.values.filter{it.supported && it.ready}
         check(eligible.isNotEmpty()){"RTC_NO_READY_NODE"}
         check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
         val fork=IncomingForkCoordinator(eligible.map{it.gatewayId})
         check(incomingOffers.putIfAbsent(id,fork)==null){"RTC_INCOMING_ALREADY_OFFERED"}
         var offered=0
+        var ringWindow=INCOMING_RING_MS
         try {
             for(node in eligible){
                 check(valid()){"RTC_INCOMING_RETIRED"}
-                val remaining=remainingRingMs(ringStartedAt,SystemClock.elapsedRealtime())
-                if(remaining<=0)break
+                val window=if(node.ringUntilEnd && node.receptionV2)RING_UNTIL_END_MS else INCOMING_RING_MS
+                val remaining=remainingRingMs(ringStartedAt,SystemClock.elapsedRealtime(),window)
+                // An older node's short window may be over while a newer
+                // node still takes the call.
+                if(remaining<=0)continue
                 if(!fork.beginCreate(node.gatewayId))break
                 var requestAttempted=false
                 var snapshot:JSONObject?=null
@@ -150,6 +158,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 val deliveries=fork.completeCreate(node.gatewayId,outcome)
                 deliveries.forEach{GatewayDatabase.get(context).queueRtcTerminal(id,it.nodeGatewayId,it.kind)}
 
+                if(outcome!=IncomingForkCoordinator.CreateOutcome.REJECTED)ringWindow=maxOf(ringWindow,window)
                 if(snapshot!=null){
                     offered++
                     try{orchestrator.onRtcControlSnapshot(node,snapshot!!)}catch(error:Exception){
@@ -160,7 +169,8 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 }
             }
             check(offered>0){"RTC_INCOMING_NOT_OFFERED"}
-            Log.i("GsmRtc","call_id=$id event=incoming_offered nodes=$offered")
+            Log.i("GsmRtc","call_id=$id event=incoming_offered nodes=$offered ring_window_ms=$ringWindow")
+            return ringWindow
         }finally{
             fork.finishOffers()
             incomingOffers.remove(id,fork)
