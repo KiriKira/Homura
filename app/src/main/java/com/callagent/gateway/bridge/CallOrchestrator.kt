@@ -852,12 +852,14 @@ class CallOrchestrator(
             // never offered a second time.
             val manager = checkNotNull(rtcControl) { "RTC_CONTROL_NOT_STARTED" }
             rtcIncoming = true
-            manager.offerIncoming(mapping, callId, callerNumber, ringStartedAt) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
+            val ringWindow = manager.offerIncoming(mapping, callId, callerNumber, ringStartedAt) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
             // The window runs from the first RINGING, as the nodes were told.
-            // Hosts must answer within the window; the gateway waits a poll
-            // longer, so an answer made just before the end is still seen.
-            // An answer already being set up has its own timeouts.
-            schedule(remainingRingMs(ringStartedAt, SystemClock.elapsedRealtime()).coerceAtLeast(0) + RING_ANSWER_GRACE_MS) {
+            // A current node rings until the cellular call ends, which tears
+            // this down; its window only bounds a call nothing ends. Hosts must
+            // answer within it; the gateway waits a poll longer, so an answer
+            // made just before the end is still seen. An answer already being
+            // set up has its own timeouts.
+            schedule(remainingRingMs(ringStartedAt, SystemClock.elapsedRealtime(), ringWindow).coerceAtLeast(0) + RING_ANSWER_GRACE_MS) {
                 if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED && activeRtcLeg == null) {
                     tearDown("Incoming call was not answered in time", leaveRinging = true)
                 }
