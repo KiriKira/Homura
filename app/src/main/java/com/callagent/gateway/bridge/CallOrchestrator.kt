@@ -225,8 +225,22 @@ class CallOrchestrator(
     private fun rtcLegCurrent(id: String, gen: Long) = !stopped && generation == gen && activeBusinessCallId == id &&
         bridgeState !in setOf(BridgeState.IDLE, BridgeState.TEARING_DOWN) && activeRtcLeg?.snapshot?.getString("call_id") == id
 
+    /** A cellular call rings or is up on this phone. Unlike [cellularCallPresent],
+     * an unreadable state does not count: that would refuse every outgoing call. */
+    private fun cellularLineBusy(): Boolean =
+        (GsmCallManager.activeCall != null && GsmCallManager.activeCallState != Call.STATE_DISCONNECTED) ||
+            (context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED &&
+                runCatching { context.getSystemService(TelecomManager::class.java)?.isInCall == true }.getOrDefault(false))
+
     private fun prepareRtcLeg(leg: RtcControlLeg, gen: Long, incoming: Boolean) {
         val snapshot = leg.snapshot; val id = snapshot.getString("call_id")
+        if (!incoming && cellularLineBusy()) {
+            // Telecom refuses to place a call while another one rings (an
+            // incoming call left unanswered keeps ringing here) or is active.
+            Log.i("GsmRtc", "media=webrtc call_control=rtc call_id=$id event=outgoing_refused_line_busy")
+            telecomHandler.post { if (rtcLegCurrent(id, gen)) tearDown("Line busy: another cellular call is ringing or active on this phone") }
+            return
+        }
         try {
             val revision = if (leg.node.primary) snapshot.getLong("mapping_revision") else
                 checkNotNull(nodeRevisionResolver(context, leg.node.gatewayId, snapshot.getString("sim_id"), snapshot.getLong("mapping_revision"))) { "RTC_NODE_SIM_CHANGED" }
@@ -748,7 +762,8 @@ class CallOrchestrator(
 
         // Track the GSM call object as soon as we see it, so teardown works
         // even if the call never reaches ACTIVE (e.g. wrong number, rejected)
-        if (activeGsmCall == null && bridgeState != BridgeState.IDLE) {
+        if (activeGsmCall == null && bridgeState != BridgeState.IDLE &&
+            mayBeDispatchedCall(state, runCatching { callDirection(call) }.getOrDefault(DIRECTION_UNKNOWN))) {
             activeGsmCall = call
             // Teardown of this dispatch began before Telecom reported the call.
             if (bridgeState == BridgeState.TEARING_DOWN && state != Call.STATE_DISCONNECTED) {
@@ -839,8 +854,13 @@ class CallOrchestrator(
             rtcIncoming = true
             manager.offerIncoming(mapping, callId, callerNumber, ringStartedAt) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
             // The window runs from the first RINGING, as the nodes were told.
-            schedule(remainingRingMs(ringStartedAt, SystemClock.elapsedRealtime()).coerceAtLeast(0)) {
-                if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED) tearDown("Incoming call was not answered in time", leaveRinging = true)
+            // Hosts must answer within the window; the gateway waits a poll
+            // longer, so an answer made just before the end is still seen.
+            // An answer already being set up has its own timeouts.
+            schedule(remainingRingMs(ringStartedAt, SystemClock.elapsedRealtime()).coerceAtLeast(0) + RING_ANSWER_GRACE_MS) {
+                if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED && activeRtcLeg == null) {
+                    tearDown("Incoming call was not answered in time", leaveRinging = true)
+                }
             }
         } catch (_: Throwable) {
             postInboundFlowFailure(gsmCall, callId, mapping.simId, callGeneration, "Incoming call could not be offered")
@@ -1112,5 +1132,27 @@ class CallOrchestrator(
         private const val MAX_DTMF_TONE_MS = 2_000L
         /** How long a dispatch may stay unreported by Telecom before it counts as never placed. */
         private const val UNSEEN_DISPATCH_SETTLE_MS = 30_000L
+        /** Longer than a call-control poll plus a request, at the slow cadence. */
+        internal const val RING_ANSWER_GRACE_MS = 2_000L
+        internal const val DIRECTION_UNKNOWN = -1
+        internal const val DIRECTION_INCOMING = 0
+        internal const val DIRECTION_OUTGOING = 1
+
+        private fun callDirection(call: Call): Int = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            when (call.details.callDirection) {
+                Call.Details.DIRECTION_INCOMING -> DIRECTION_INCOMING
+                Call.Details.DIRECTION_OUTGOING -> DIRECTION_OUTGOING
+                else -> DIRECTION_UNKNOWN
+            }
+        } else DIRECTION_UNKNOWN
+
+        /**
+         * Whether a Telecom call seen during a dispatch can be the call this
+         * gateway placed. An incoming call never is: one left ringing after
+         * its window once took over an outgoing dispatch, and its missed END
+         * then ended the outgoing call too.
+         */
+        internal fun mayBeDispatchedCall(state: Int, direction: Int): Boolean =
+            state != Call.STATE_RINGING && direction != DIRECTION_INCOMING
     }
 }
