@@ -17,6 +17,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+private const val LIVE_POLL_MS=250L
+private const val IDLE_POLL_NANOS=750_000_000L
+private val SETTING_UP=setOf("reserved","pending_wakeup","ringing","dialing","connecting")
+
 /** Per-node authenticated control loops. They share exactly one physical
  * orchestrator, SIM validator, occupancy and durable cellular executor. */
 class GatewayCallControl(private val context: Context, private val orchestrator: CallOrchestrator) : AutoCloseable {
@@ -32,6 +36,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         @Volatile var globalDecline = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
+        /** The last poll saw a call still being set up: poll at the fast cadence. */
+        @Volatile var liveCalls = false
+        var lastPollAt = 0L
     }
     private val closed=AtomicBoolean()
     private val nodes=ConcurrentHashMap<String,Node>()
@@ -57,7 +64,12 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             nodes[node.gatewayId]=node
             val worker=Executors.newSingleThreadScheduledExecutor{Thread(it,"RTC-Gateway-${node.gatewayId.take(8)}")}
             workers[node.gatewayId]=worker
-            worker.scheduleWithFixedDelay({poll(node,client)},0,750,TimeUnit.MILLISECONDS)
+            // While a call is being set up, poll every 250 ms so a host's answer
+            // and its media reach the gateway sooner. Otherwise stay at 750 ms.
+            worker.scheduleWithFixedDelay({
+                val live=node.liveCalls || incomingOffers.isNotEmpty()
+                if(live || System.nanoTime()-node.lastPollAt>=IDLE_POLL_NANOS)poll(node,client)
+            },0,LIVE_POLL_MS,TimeUnit.MILLISECONDS)
         }
         (nodes.keys-wanted).forEach{id->workers.remove(id)?.shutdownNow();nodes.remove(id)}
         runCatching{orchestrator.reconcileUnresolvedCellular()}.onFailure{
@@ -66,6 +78,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     }
     private fun poll(node:Node,client:ControlApiClient){
         if(closed.get())return
+        node.lastPollAt=System.nanoTime()
         try{
             val now=System.nanoTime()
             if(now-node.capabilityAt>25_000_000_000L){
@@ -89,6 +102,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
             }
             val calls=node.control.calls();node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
+            node.liveCalls=calls.any{it.optString("state") in SETTING_UP}
             if(!wasReady)orchestrator.onRtcNodeReady()
             calls.forEach{orchestrator.onRtcControlSnapshot(node,it)}
         }catch(_:Throwable){
