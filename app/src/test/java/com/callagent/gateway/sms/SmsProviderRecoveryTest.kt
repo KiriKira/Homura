@@ -191,6 +191,57 @@ class SmsProviderRecoveryTest {
     }
 
     @Test
+    fun aBroadcastRedactedAfterUploadStillMatchesItsInboxRow() {
+        // The server ACK erases sender and text locally, usually long before
+        // recovery reads the provider row; matching must survive that.
+        val networkAt = 8_000_000L
+        val event = database.recordIncomingSms(
+            messageId = UUID.randomUUID().toString(), sender = "+15550001111", recipient = "",
+            body = "uploaded text", receivedAt = networkAt, partCount = 1, subId = 7,
+            slotIndex = 0, simId = null, mappingRevision = null, resolution = "unknown"
+        )
+        database.acknowledgeEvents(listOf(event.eventId))
+        val phoneAt = networkAt + 474L
+        val source = FakeInbox(listOf(providerRow(1, "uploaded text", phoneAt, "+15550001111", dateSent = networkAt, subId = 7)))
+        SmsProviderRecovery.configureForTest(
+            context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, phoneAt
+        )
+        val result = SmsProviderRecovery.scanForTest(
+            context, session, source, 10, phoneAt + SmsProviderRecovery.BROADCAST_GRACE_MS
+        )
+
+        assertEquals(1, result.matchedBroadcasts)
+        assertEquals(0, result.importedRows)
+        assertEquals(1, receivedEventCount())
+    }
+
+    @Test
+    fun aRowRedactedBeforeDigestsExistedMatchesOnlyOnTheExactNetworkTime() {
+        val networkAt = 9_000_000L
+        val event = database.recordIncomingSms(
+            messageId = UUID.randomUUID().toString(), sender = "+15550001111", recipient = "",
+            body = "old text", receivedAt = networkAt, partCount = 1, subId = 7,
+            slotIndex = 0, simId = null, mappingRevision = null, resolution = "unknown"
+        )
+        database.acknowledgeEvents(listOf(event.eventId))
+        database.writableDatabase.execSQL("UPDATE inbox SET match_digest=NULL")
+        val source = FakeInbox(listOf(
+            providerRow(1, "old text", networkAt + 300L, "+15550001111", dateSent = networkAt, subId = 7),
+            providerRow(2, "other text", networkAt + 2_300L, "+15550001111", dateSent = networkAt + 2_000L, subId = 7)
+        ))
+        SmsProviderRecovery.configureForTest(
+            context, session, SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX, source, networkAt
+        )
+        val result = SmsProviderRecovery.scanForTest(
+            context, session, source, 10, networkAt + SmsProviderRecovery.BROADCAST_GRACE_MS + 3_000L
+        )
+
+        assertEquals(1, result.matchedBroadcasts)
+        assertEquals(1, result.importedRows)
+        assertEquals(2, receivedEventCount())
+    }
+
+    @Test
     fun aRowYoungerThanTheBroadcastGraceWaitsForItsBroadcast() {
         val phoneAt = 6_000_000L
         val source = FakeInbox(listOf(
@@ -284,10 +335,11 @@ class SmsProviderRecoveryTest {
         body: String,
         date: Long,
         sender: String = "+15550002222",
-        dateSent: Long = date
+        dateSent: Long = date,
+        subId: Int = -1
     ) = SmsProviderRecovery.RawRow(
         rowId = id, sender = sender, body = body, date = date, dateSent = dateSent,
-        subscriptionId = -1, serviceCenter = "+15550000001", protocol = 0
+        subscriptionId = subId, serviceCenter = "+15550000001", protocol = 0
     )
 
     private fun receivedEventCount(): Int = database.readableDatabase.rawQuery(

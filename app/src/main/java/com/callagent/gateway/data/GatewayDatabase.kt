@@ -140,6 +140,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             slot_index INTEGER NOT NULL, resolution TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'broadcast', archive_gateway_id TEXT,
             archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown', archive_sim_label TEXT,
+            match_digest TEXT,
             FOREIGN KEY(event_id) REFERENCES events(event_id)
         )""")
         db.execSQL("""CREATE TABLE commands (
@@ -239,6 +240,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
             createMeshTables(db)
         }
+        if (oldVersion < 10) db.execSQL("ALTER TABLE inbox ADD COLUMN match_digest TEXT")
     }
 
     private fun createCallWinnerTable(db: SQLiteDatabase) {
@@ -388,6 +390,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     else put("archive_gateway_id", event.ownerGatewayId)
                     put("archive_source", archiveSource)
                     if (simLabel == null) putNull("archive_sim_label") else put("archive_sim_label", simLabel)
+                    put("match_digest", smsMatchDigest(db, sender, body))
                 }
                 db.insertOrThrow("inbox", null, values)
                 archiveInbound(
@@ -694,13 +697,37 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     WHERE e.owner_gateway_id=? AND i.source='broadcast' AND $near AND $match""",
                 arrayOf(ownerGatewayId, row.receivedAt.toString(), window, sentAt.toString(), window, *values)
             ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+            val digest = count("i.match_digest=?", smsMatchDigest(db, row.sender, row.body))
+            val erased = count("i.body='' AND i.sender=''")
             val both = count("i.sender=? AND i.body=?", row.sender, row.body)
             val bodyOnly = count("i.sender!=? AND i.body=?", row.sender, row.body)
             val senderOnly = count("i.sender=? AND i.body!=?", row.sender, row.body)
             android.util.Log.i("SmsRecovery", "Importing an inbox row no broadcast matched; broadcasts within 10 min: " +
-                "same=$both bodyOnly=$bodyOnly senderOnly=$senderOnly sub=${row.subscriptionId} " +
+                "digest=$digest erased=$erased same=$both bodyOnly=$bodyOnly senderOnly=$senderOnly sub=${row.subscriptionId} " +
                 "sentSkewMs=${if (row.sentAt > 0) row.receivedAt - row.sentAt else "n/a"}")
         }
+    }
+
+    /** A per-install secret, so the digest kept after redaction cannot be
+     * brute-forced back into a short message without this database. */
+    private fun smsMatchKey(db: SQLiteDatabase): ByteArray {
+        fun read() = db.rawQuery("SELECT value FROM gateway_identity WHERE key='sms_match_key'", null)
+            .use { if (it.moveToFirst()) it.getString(0) else null }
+        val stored = read() ?: run {
+            val fresh = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+                .joinToString("") { "%02x".format(it) }
+            db.execSQL("INSERT OR IGNORE INTO gateway_identity(key,value) VALUES('sms_match_key',?)", arrayOf(fresh))
+            checkNotNull(read())
+        }
+        return stored.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
+    /** Keyed digest of what identifies an SMS; it survives the post-upload redaction. */
+    internal fun smsMatchDigest(db: SQLiteDatabase, sender: String, body: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(smsMatchKey(db), "HmacSHA256"))
+        mac.update("gsm2sip.sms.match.v1\u0000$sender\u0000$body".toByteArray(Charsets.UTF_8))
+        return mac.doFinal().joinToString("") { "%02x".format(it) }
     }
 
     private fun findBroadcastEvidence(
@@ -721,16 +748,24 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val sentAt = row.sentAt.takeIf { it > 0 } ?: row.receivedAt
         val window = SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString()
         val subscriptionClause = if (row.subscriptionId >= 0) "AND (i.sub_id<0 OR i.sub_id=?)" else ""
+        // Sender and text are erased once the server acknowledges the upload,
+        // usually before recovery reads the provider row, so match on the
+        // keyed digest kept at receipt. Rows erased before digests existed
+        // can only match on the exact network timestamp (the PDU time the
+        // broadcast recorded is the provider's date_sent).
         val query = """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
                 WHERE e.owner_gateway_id=? AND e.type='sms.received' AND i.source='broadcast'
-                AND i.sender=? AND i.body=?
+                AND (i.match_digest=?
+                    OR (i.match_digest IS NULL AND i.sender=? AND i.body=?)
+                    OR (i.match_digest IS NULL AND i.body='' AND i.sender='' AND CAST(? AS INTEGER)>0 AND i.received_at=CAST(? AS INTEGER)))
                 AND (ABS(i.received_at-?)<=CAST(? AS INTEGER) OR ABS(i.received_at-?)<=CAST(? AS INTEGER))
                 $subscriptionClause
                 AND NOT EXISTS (SELECT 1 FROM sms_provider_imports p
                     WHERE p.owner_gateway_id=? AND p.session_scope=? AND p.event_id=i.event_id)
                 ORDER BY MIN(ABS(i.received_at-?),ABS(i.received_at-?)),i.received_at,i.event_id LIMIT 2"""
         val args = buildList {
-            add(ownerGatewayId); add(row.sender); add(row.body)
+            add(ownerGatewayId); add(smsMatchDigest(db, row.sender, row.body)); add(row.sender); add(row.body)
+            add(row.sentAt.toString()); add(row.sentAt.toString())
             add(row.receivedAt.toString()); add(window); add(sentAt.toString()); add(window)
             if (row.subscriptionId >= 0) add(row.subscriptionId.toString())
             add(ownerGatewayId); add(sessionScope)
@@ -1948,7 +1983,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
         private const val TAG = "GatewayDatabase"
-        private const val VERSION = 9
+        private const val VERSION = 10
         /** client_id of a decline: it ends the call for every host. */
         private const val DECLINED_BY_HOST = "declined_by_host"
         private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +
