@@ -180,8 +180,8 @@ def main() -> None:
 
     output_dir = Path("release-artifact/payload")
     output_dir.mkdir(parents=True, exist_ok=True)
-    staged_apk = output_dir / "gateway.apk"
-    staged_module = output_dir / "gateway-magisk.zip"
+    staged_apk = output_dir / "Homura.apk"
+    staged_module = output_dir / "Homura-Magisk.zip"
     shutil.copyfile(apk, staged_apk)
     shutil.copyfile(module, staged_module)
     manifest = {

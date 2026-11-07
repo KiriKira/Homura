@@ -1,4 +1,4 @@
-name: Gateway signed releases
+name: Homura signed releases
 
 on:
   push:
@@ -84,8 +84,8 @@ jobs:
             echo "GSM_RELEASE_VERSION_CODE=$version_code"
             echo "GSM_RELEASE_VERSION_NAME=$version_name"
           } >> "$GITHUB_ENV"
-          artifact_name="gateway-release-${GITHUB_RUN_NUMBER}-${sha7}"
-          validation_artifact_name="gateway-validation-${GITHUB_RUN_NUMBER}-${sha7}"
+          artifact_name="Homura-release-${GITHUB_RUN_NUMBER}-${sha7}"
+          validation_artifact_name="Homura-validation-${GITHUB_RUN_NUMBER}-${sha7}"
           {
             echo "version_code=$version_code"
             echo "version_name=$version_name"
@@ -245,14 +245,22 @@ jobs:
           overwrite: true
           retention-days: 14
 
+      - name: Stage branded non-main validation files
+        if: steps.release_metadata.outputs.sign_release != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp gateway.apk Homura-debug.apk
+          cp gateway-magisk.zip Homura-debug-Magisk.zip
+
       - name: Upload non-main validation artifacts
         if: steps.release_metadata.outputs.sign_release != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.release_metadata.outputs.validation_artifact_name }}
           path: |
-            gateway.apk
-            gateway-magisk.zip
+            Homura-debug.apk
+            Homura-debug-Magisk.zip
           if-no-files-found: error
           overwrite: true
           retention-days: 14
@@ -390,22 +398,22 @@ jobs:
             --ks-key-alias "$GSM_RELEASE_KEY_ALIAS" \
             --ks-pass env:GSM_RELEASE_STORE_PASSWORD \
             --key-pass env:GSM_RELEASE_KEY_PASSWORD \
-            --out gateway-debug-signed.apk gateway.apk
-          "$tools/apksigner" verify --verbose --print-certs gateway-debug-signed.apk > signature.txt
+            --out Homura-debug-signed.apk gateway.apk
+          "$tools/apksigner" verify --verbose --print-certs Homura-debug-signed.apk > signature.txt
           cat signature.txt
           expected="${GSM_RELEASE_CERT_SHA256//:/}"
           expected="${expected,,}"
           actual="$(awk -F': ' '/Signer #1 certificate SHA-256 digest:/ { print tolower($2); exit }' signature.txt)"
           [[ "$actual" == "$expected" ]] || { echo '::error::APK certificate does not match the permanent release certificate pin.'; exit 1; }
-          "$tools/aapt" dump badging gateway-debug-signed.apk > badging.txt
+          "$tools/aapt" dump badging Homura-debug-signed.apk > badging.txt
           grep -qx 'application-debuggable' badging.txt
-          mv gateway-debug-signed.apk gateway-debug.apk
+          mv Homura-debug-signed.apk Homura-debug.apk
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
 
           archive = Path("gateway-magisk.zip")
-          apk = Path("gateway-debug.apk").read_bytes()
+          apk = Path("Homura-debug.apk").read_bytes()
           replacement = "system/priv-app/Gateway/Gateway.apk"
           temporary = archive.with_suffix(".signed.zip")
           with ZipFile(archive, "r") as source:
@@ -419,7 +427,8 @@ jobs:
               if check.read(replacement) != apk:
                   raise SystemExit("Magisk module APK does not match the signed debug APK")
           PY
-          sha256sum gateway-debug.apk gateway-magisk.zip > SHA256SUMS.txt
+          mv gateway-magisk.zip Homura-debug-Magisk.zip
+          sha256sum Homura-debug.apk Homura-debug-Magisk.zip > SHA256SUMS.txt
           cat > BUILD-REPORT.md <<EOF
           # Gateway signed debug build
 
@@ -427,15 +436,15 @@ jobs:
           Branch: ${GITHUB_REF_NAME}
           Android variant: debuggable, version ${GSM_RELEASE_VERSION_NAME} (${GSM_RELEASE_VERSION_CODE})
           APK signing certificate SHA-256: ${expected}
-          APK SHA-256: $(sha256sum gateway-debug.apk | awk '{print $1}')
+          APK SHA-256: $(sha256sum Homura-debug.apk | awk '{print $1}')
           Magisk module embeds this exact APK: verified
           EOF
       - uses: actions/upload-artifact@v4
         with:
-          name: gateway-permanent-key-signed-debug
+          name: Homura-permanent-key-signed-debug
           path: |
-            gateway-debug.apk
-            gateway-magisk.zip
+            Homura-debug.apk
+            Homura-debug-Magisk.zip
             SHA256SUMS.txt
             BUILD-REPORT.md
           if-no-files-found: error

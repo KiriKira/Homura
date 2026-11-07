@@ -49,8 +49,8 @@ Every build uses the same Android `versionCode`, 1000000000. Android refuses to 
 
 Each release contains:
 
-- `gateway.apk` — signed for direct Android installation.
-- `gateway-magisk.zip` — Magisk module with the byte-identical signed APK and tools for arm64-v8a, armeabi-v7a, x86_64, and x86.
+- `Homura.apk` — signed for direct Android installation.
+- `Homura-Magisk.zip` — Magisk module with the byte-identical signed APK and tools for arm64-v8a, armeabi-v7a, x86_64, and x86.
 - `release-manifest.json` — source commit, Android version, signing certificate fingerprint, and SHA-256 plus byte size for each APK/ZIP.
 - `SHA256SUMS.txt` — checksums for the APK, Magisk ZIP, and manifest.
 
