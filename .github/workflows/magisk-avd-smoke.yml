@@ -84,13 +84,21 @@ jobs:
             --avd-home "$ANDROID_AVD_HOME" \
             --gateway-zip gateway-magisk.zip
 
+      - name: Stage branded Magisk module
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f gateway-magisk.zip ]]; then
+            cp gateway-magisk.zip Homura-debug-Magisk.zip
+          fi
+
       - name: Upload Magisk and module lifecycle evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gsm2sip-magisk-avd-smoke
+          name: Homura-magisk-avd-smoke
           path: |
             artifacts/magisk-avd-smoke/**
-            gateway-magisk.zip
+            Homura-debug-Magisk.zip
           if-no-files-found: warn
           retention-days: 14

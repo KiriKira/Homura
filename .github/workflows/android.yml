@@ -1,4 +1,4 @@
-name: Gateway checks
+name: Homura checks
 on:
   push:
   pull_request:
@@ -39,12 +39,17 @@ jobs:
               info['sha256']['gateway-magisk.zip'] = hashlib.sha256(Path('gateway-magisk.zip').read_bytes()).hexdigest()
           Path('BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
           PY
+      - name: Stage branded debug downloads
+        run: |
+          set -euo pipefail
+          cp app/build/outputs/apk/debug/app-debug.apk Homura-debug.apk
+          cp gateway-magisk.zip Homura-debug-Magisk.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: gateway-development-apk
+          name: Homura-development-apk
           path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            gateway-magisk.zip
+            Homura-debug.apk
+            Homura-debug-Magisk.zip
             BUILD-INFO.json
             DEBUG-BATCH.md
           if-no-files-found: error
