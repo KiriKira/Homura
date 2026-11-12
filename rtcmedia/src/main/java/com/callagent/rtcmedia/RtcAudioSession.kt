@@ -31,7 +31,8 @@ class RtcAudioSession(
     private val onFailure: (String) -> Unit,
     private val onLog: (String) -> Unit = {},
     private val forceRelay: Boolean = false,
-    additionalRelaySources: List<RelaySource> = emptyList()
+    private val additionalRelaySources: List<RelaySource> = emptyList(),
+    currentRelayNodeId:String?=null
 ) : AutoCloseable {
     private val callControl = admission.optString("call_control", "sip")
     private val binding = admission.getJSONObject("binding")
@@ -40,7 +41,7 @@ class RtcAudioSession(
     private val attemptId = binding.getString("attempt_id")
     private val selfId = binding.getString(if (gateway) "gateway_id" else "client_id")
     private val remoteId = binding.getString(if (gateway) "client_id" else "gateway_id")
-    private val relaySelection = RelaySources.select(buildList {
+    private val nodeServers = buildList {
         val items = admission.getJSONArray("ice_servers")
         for (i in 0 until items.length()) {
             val item = items.getJSONObject(i)
@@ -49,9 +50,9 @@ class RtcAudioSession(
                 if (item.has("username")) item.getString("username") else null,
                 if (item.has("credential")) item.getString("credential") else null))
         }
-    }, additionalRelaySources).also {
-        if (additionalRelaySources.any { source -> source.enabled }) RelaySources.requireNativeCompatible(it)
     }
+    private val nodeRelayPolicy=RelayRepository.nodePolicy(context,currentRelayNodeId)
+    private val relaySelection=RelaySources.select(if(nodeRelayPolicy.first)nodeServers else emptyList(),additionalRelaySources,RelayRepository.cachedRank(context,nodeServers),nodeRelayPolicy.second).let(TurnCredentials::resolve)
     private val servers = relaySelection.servers.map { item ->
         PeerConnection.IceServer.builder(item.urls).apply {
             item.username?.let(::setUsername)
@@ -97,7 +98,7 @@ class RtcAudioSession(
         worker.execute {
             try {
                 if(closed.get())return@execute
-                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl)
+                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl,additionalRelaySources.any{it.enabled})
                 if(closed.get()){native.close();return@execute};peer=native
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
                 event("native_ready elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")
@@ -238,6 +239,7 @@ class RtcAudioSession(
         }
     }
     private fun event(event:String){
+        if(event.startsWith("stats "))Regex("relay_sources=([^ ]+)").find(event)?.groupValues?.get(1)?.let{RelayStatus.record(context,callId,it)}
         val line="media=webrtc call_control=$callControl call_id=$callId leg_id=$legId role=${if(gateway)"gateway" else "host"} event=$event"
         Log.i("GsmRtc",line);onLog(line)
     }
@@ -257,7 +259,7 @@ class RtcAudioSession(
 
     private fun close(notifyPeer:Boolean){
         if(!closed.compareAndSet(false,true))return
-        connectionLatch.countDown();peer?.close();peer=null
+        connectionLatch.countDown();peer?.close();peer=null;RelayStatus.clear(callId)
         if(notifyPeer)runCatching{worker.execute {runCatching{send("close")}}}
         worker.shutdown()
         event("closed")

@@ -87,6 +87,7 @@ class GatewayService : Service() {
     private var wakeIdentity: WakeSessionIdentity? = null
     private var wakeRetryFuture: ScheduledFuture<*>? = null
     private var wakeGeneration = 0L
+    private var wakeOpenedAt = 0L
     private var wakeRetryMs = WAKE_RETRY_INITIAL_MS
     @Volatile private var wakeAuthBlocked = false
     private var wakeAuthorizationTokenToRefresh: String? = null
@@ -623,7 +624,15 @@ class GatewayService : Service() {
         connectWakeSession(session)
     }
 
+    private var wakeRetryAt=0L
     private fun connectWakeSession(session: CredentialStore.Session) {
+        if(com.callagent.rtcmedia.NodeControlSocket.live(session.controlBaseUrl,session.accessToken)){
+            com.callagent.rtcmedia.NodeControlSocket.listen(session.controlBaseUrl,"homura-primary"){
+                if(wakeRuntimeAllowed()&&CredentialStore.load(this)?.gatewayId==session.gatewayId)wakeControlLoop()
+            }
+            synchronized(wakeConnectionGuard){wakeGeneration++;wakeRetryFuture?.cancel(false);wakeRetryFuture=null;wakeConnection?.close();wakeConnection=null;wakeIdentity=null}
+            GatewayBackgroundRuntime.updateConnection(this,"WSS control connected");return
+        }
         val identity = WakeSessionIdentity.from(session)
         synchronized(wakeConnectionGuard) {
             if (!wakeRuntimeAllowed()) return
@@ -635,11 +644,12 @@ class GatewayService : Service() {
             }
             if (currentIdentity == identity && wakeConnection != null) return
 
+            if(android.os.SystemClock.elapsedRealtime()<wakeRetryAt)return
             val tokenChanged = currentIdentity != identity
             if (tokenChanged) {
                 wakeGeneration++
                 wakeIdentity = identity
-                wakeRetryMs = WAKE_RETRY_INITIAL_MS
+                if(currentIdentity==null)wakeRetryMs = WAKE_RETRY_INITIAL_MS
             }
             wakeRetryFuture?.cancel(false)
             wakeRetryFuture = null
@@ -664,7 +674,7 @@ class GatewayService : Service() {
                         if (!isCurrentWake(generation, identity)) return
                         synchronized(wakeConnectionGuard) {
                             if (generation != wakeGeneration || identity != wakeIdentity) return
-                            wakeRetryMs = WAKE_RETRY_INITIAL_MS
+                            wakeOpenedAt = android.os.SystemClock.elapsedRealtime()
                             wakeRetryFuture?.cancel(false)
                             wakeRetryFuture = null
                         }
@@ -681,6 +691,10 @@ class GatewayService : Service() {
                         handleWakeDisconnect(generation, identity, closeCode = code)
                     }
 
+                    override fun onRateLimited(seconds:Long){
+                        synchronized(wakeConnectionGuard){wakeRetryAt=maxOf(wakeRetryAt,android.os.SystemClock.elapsedRealtime()+seconds*1000)}
+                        com.callagent.rtcmedia.NodeControlSocket.rateLimited(session.controlBaseUrl,seconds)
+                    }
                     override fun onFailure(httpStatus: Int?) {
                         handleWakeDisconnect(generation, identity, httpStatus = httpStatus)
                     }
@@ -719,9 +733,13 @@ class GatewayService : Service() {
         val (oldConnection, retryGeneration) = synchronized(wakeConnectionGuard) {
             if (generation != wakeGeneration || wakeIdentity != identity) return
             val old = wakeConnection
+            if (wakeOpenedAt != 0L && android.os.SystemClock.elapsedRealtime() - wakeOpenedAt >= 60_000L) wakeRetryMs = WAKE_RETRY_INITIAL_MS
+            wakeOpenedAt = 0L
             wakeConnection = null
             wakeGeneration++
             if (authorizationFailure) {
+                wakeRetryAt=android.os.SystemClock.elapsedRealtime()+wakeRetryMs
+                wakeRetryMs=(wakeRetryMs*2).coerceAtMost(WAKE_RETRY_MAX_MS)
                 wakeAuthBlocked = true
                 wakeAuthorizationTokenToRefresh = identity.tokenGeneration
                 wakeRetryFuture?.cancel(false)
@@ -762,7 +780,8 @@ class GatewayService : Service() {
         val baseDelay = wakeRetryMs
         wakeRetryMs = (wakeRetryMs * 2).coerceAtMost(WAKE_RETRY_MAX_MS)
         val jitteredDelay = (baseDelay * ThreadLocalRandom.current().nextDouble(0.8, 1.2)).toLong()
-            .coerceAtLeast(1_000L)
+            .coerceAtLeast(maxOf(1_000L,wakeRetryAt-android.os.SystemClock.elapsedRealtime()))
+        wakeRetryAt=android.os.SystemClock.elapsedRealtime()+jitteredDelay
         GatewayBackgroundRuntime.updateConnection(this, "HTTPS polling · WSS retrying")
         broadcastLog("CONTROL: WSS retry scheduled in ${jitteredDelay / 1000}s")
         wakeRetryFuture = try {
@@ -788,6 +807,7 @@ class GatewayService : Service() {
             wakeAuthBlocked = false
             wakeAuthorizationTokenToRefresh = null
             wakeIdentity = null
+            wakeRetryAt=0L
             wakeConnection?.close()
             wakeConnection = null
         }
@@ -901,6 +921,7 @@ class GatewayService : Service() {
         }
     }
 
+    private var lastColdHeartbeat=-60_000L
     private fun syncControlPlaneOnce() {
         val session = CredentialStore.load(this)
             ?: throw ControlApiException("PAIRING_REQUIRED", "Pairing required")
@@ -931,6 +952,8 @@ class GatewayService : Service() {
         val installId = if (ControlExtensions.accepts(this, session.gatewayId, session.controlBaseUrl,
                 MeshCoordinator.MESH_EXTENSION)) database.installId() else null
 
+        val heartbeatNow=android.os.SystemClock.elapsedRealtime()
+        if(!com.callagent.rtcmedia.NodeControlSocket.supports(session.controlBaseUrl,"cold_standby_v1")||heartbeatNow-lastColdHeartbeat>=60_000L){
         val heartbeat = database.prepareHeartbeatPayload(session.gatewayId) { sequence ->
             client.heartbeatBody(sequence, RootShell.rootState() == "ok",
                 batteryPercent, charging, sims, installId).toString()
@@ -957,6 +980,9 @@ class GatewayService : Service() {
             heartbeatResult.invalidatedSimIds)
         database.completeHeartbeat(session.gatewayId, heartbeat.first)
         ControlExtensions.record(this, session.gatewayId, session.controlBaseUrl, heartbeatResult.extensions)
+            lastColdHeartbeat=heartbeatNow
+        }
+
 
         database.emitAliasEvents(session.gatewayId)
         val events = database.pendingEvents(session.gatewayId, 50)
@@ -988,7 +1014,7 @@ class GatewayService : Service() {
     }
 
     private val meshCoordinator by lazy {
-        MeshCoordinator(this, ::processCommands) { line -> broadcastLog(line) }
+        MeshCoordinator(this, ::processCommands, {wakeControlLoop()}) { line -> broadcastLog(line) }
     }
 
     private fun meshHeartbeatInputs(): MeshHeartbeatInputs {
@@ -1577,6 +1603,7 @@ class GatewayService : Service() {
     }
 
     override fun onDestroy() {
+        com.callagent.rtcmedia.NodeControlSocket.unlisten("homura-primary")
         unregisterNetworkCallback()
         stopGateway(userInitiated = false)
         powerLeaseScheduler.shutdownNow()

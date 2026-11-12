@@ -24,11 +24,13 @@ internal class NativePeer(
     private val onDigit: (Char) -> Unit,
     private val onFailure: (String) -> Unit,
     forceRelay: Boolean = false,
-    private val relayOrigins: (String) -> Set<String> = { emptySet() }
+    private val relayOrigins: (String) -> Set<String> = { emptySet() },
+    private val multipleSources:Boolean=false
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
     private val localCandidates = LocalIceQueue<IceCandidate>()
+    private val candidateBudget=CandidateBudget()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
     val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
     fun takeCandidates(): LocalIceQueue.Batch<IceCandidate> = localCandidates.drain()
@@ -111,6 +113,7 @@ internal class NativePeer(
                 onEvent("gathering_${state.name.lowercase()}")
             }
             override fun onIceCandidate(candidate: IceCandidate) {
+                if(multipleSources && !candidateBudget.accept(candidate.sdp)){onEvent("local_candidate_filtered_budget");return}
                 if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }
                 if (!localCandidates.add(candidate)) onEvent("late_local_candidate_ignored")
             }
