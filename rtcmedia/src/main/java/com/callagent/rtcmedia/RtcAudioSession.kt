@@ -52,7 +52,7 @@ class RtcAudioSession(
         }
     }
     private val nodeRelayPolicy=RelayRepository.nodePolicy(context,currentRelayNodeId)
-    private val relaySelection=RelaySources.select(if(nodeRelayPolicy.first)nodeServers else emptyList(),additionalRelaySources,RelayRepository.cachedRank(context,nodeServers),nodeRelayPolicy.second).let(TurnCredentials::resolve)
+    private val relaySelection=RelaySources.selectForCall(if(nodeRelayPolicy.first)nodeServers else emptyList(),additionalRelaySources,RelayRepository.cachedRank(context,nodeServers),nodeRelayPolicy.second).let(TurnCredentials::resolve)
     private val servers = relaySelection.servers.map { item ->
         PeerConnection.IceServer.builder(item.urls).apply {
             item.username?.let(::setUsername)
@@ -95,10 +95,12 @@ class RtcAudioSession(
         check(started.compareAndSet(false,true))
         startedAt=System.nanoTime()
         event("selected")
+        if(relaySelection.truncated)event("relay_sources_truncated")
+        relaySelection.fallbackReason?.let{event("relay_sources_fallback reason=$it")}
         worker.execute {
             try {
                 if(closed.get())return@execute
-                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl,additionalRelaySources.any{it.enabled})
+                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl,relaySelection.hasAdditionalSources)
                 if(closed.get()){native.close();return@execute};peer=native
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
                 event("native_ready elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")

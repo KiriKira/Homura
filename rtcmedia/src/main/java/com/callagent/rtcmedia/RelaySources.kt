@@ -13,13 +13,16 @@ class RelaySource(val id: String, val servers: List<RelayIceServer>, val enabled
 }
 
 /** Immutable input to native ICE, with provenance retained independently of credentials. */
-class RelaySelection internal constructor(val servers: List<RelayIceServer>, private val origins: Map<String, Set<String>>, private val credentialOrigins: Map<Triple<String,String?,String?>,Set<String>> = emptyMap()) {
+class RelaySelection internal constructor(val servers: List<RelayIceServer>, private val origins: Map<String, Set<String>>, private val credentialOrigins: Map<Triple<String,String?,String?>,Set<String>> = emptyMap(), val truncated:Boolean=false, val fallbackReason:String?=null) {
     fun sourcesForUrl(url: String): Set<String> = origins[url].orEmpty()
     internal fun withServers(servers:List<RelayIceServer>):RelaySelection {
         val chosen=linkedMapOf<String,Set<String>>()
         servers.forEach{s->s.urls.forEach{url->chosen[url]=credentialOrigins[Triple(url,s.username,s.credential)]?:origins[url].orEmpty()}}
-        return RelaySelection(servers,chosen,credentialOrigins)
+        return RelaySelection(servers,chosen,credentialOrigins,truncated,fallbackReason)
     }
+    val hasAdditionalSources:Boolean get()=origins.values.any{ids->ids.any{it!=RelaySources.NODE_ID}}
+    internal fun fallback()=RelaySelection(servers,origins,credentialOrigins,fallbackReason="invalid_additional_configuration")
+    internal fun truncated()=RelaySelection(servers,origins,credentialOrigins,truncated=true)
     override fun toString() = "RelaySelection(servers=${servers.size})"
 }
 
@@ -63,12 +66,30 @@ object RelaySources {
                 server.urls.forEach { validateTurnUrl(it, !source.staticOnly) }
             }
         }
-        val ordered=enabled+RelaySource(NODE_ID,node,pinned=nodePinned,staticOnly=false,rankMillis=nodeRank)
-        ordered.sortedWith(compareByDescending<RelaySource>{it.pinned}.thenBy{it.rankMillis?:Long.MAX_VALUE}.thenBy{if(it.id==NODE_ID)0 else 1})
-            .forEach { source->source.servers.forEach{append(it,source.id)} }
-        require(entries.size <= MAX_SERVERS && entries.sumOf { it.urls.size } <= MAX_URLS) { "ice_server_budget" }
-        return RelaySelection(entries.toList(), origins.mapValues { it.value.toSet() },credentialOrigins.mapValues{it.value.toSet()})
+        val ordered=(enabled+RelaySource(NODE_ID,node,pinned=nodePinned,staticOnly=false,rankMillis=nodeRank))
+            .sortedWith(compareByDescending<RelaySource>{it.pinned}.thenBy{it.rankMillis?:Long.MAX_VALUE}.thenBy{if(it.id==NODE_ID)0 else 1})
+        // Reserve the complete node configuration first, independently of its display rank.
+        // Charge only exact unique credentials/URLs, retaining whole extra sources in priority order.
+        val reserved=mutableSetOf<Triple<String,String?,String?>>()
+        fun cost(servers:List<RelayIceServer>,seen:MutableSet<Triple<String,String?,String?>>):Int=
+            servers.count{server->var fresh=false;server.urls.forEach{if(seen.add(Triple(it,server.username,server.credential)))fresh=true};fresh}
+        val groups=cost(node,reserved)
+        if(groups>MAX_SERVERS||reserved.size>MAX_URLS)return select(node).truncated()
+        val chosen=mutableSetOf(NODE_ID)
+        var truncated=false
+        for(source in ordered.filter{it.id!=NODE_ID}){
+            val proposed=mutableSetOf<Triple<String,String?,String?>>()
+            val proposedGroups=cost(ordered.filter{it.id in chosen||it.id==source.id}.flatMap{it.servers},proposed)
+            if(proposedGroups>MAX_SERVERS||proposed.size>MAX_URLS){truncated=true;continue}
+            chosen.add(source.id)
+        }
+        ordered.filter{it.id in chosen}.forEach{source->source.servers.forEach{append(it,source.id)}}
+        return RelaySelection(entries.toList(), origins.mapValues { it.value.toSet() },credentialOrigins.mapValues{it.value.toSet()},truncated)
     }
+
+    /** Configuration editors keep strict validation; media construction fails back to node input. */
+    fun selectForCall(node:List<RelayIceServer>,additional:List<RelaySource> = emptyList(),nodeRank:Long?=null,nodePinned:Boolean=false):RelaySelection =
+        try{select(node,additional,nodeRank,nodePinned)}catch(_:IllegalArgumentException){select(node).fallback()}
 
     /** Postcondition for the bounded, authenticated credential fallback. */
     fun requireNativeCompatible(selection: RelaySelection) {

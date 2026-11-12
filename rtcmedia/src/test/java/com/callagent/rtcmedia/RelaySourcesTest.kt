@@ -71,7 +71,9 @@ class RelaySourcesTest {
         val many = (1..17).map { server("turn:host$it:3478") }
         rejects("server_budget") { RelaySources.select(emptyList(), listOf(RelaySource("large", many))) }
         val node = (1..16).map { server("turn:host$it:3478") }
-        rejects("ice_server_budget") { RelaySources.select(node, listOf(source("extra", server("turn:extra:3478")))) }
+        val bounded=RelaySources.select(node, listOf(source("extra", server("turn:extra:3478"))))
+        assertTrue(bounded.truncated)
+        assertEquals(node.flatMap{it.urls},bounded.servers.flatMap{it.urls})
         rejects("url_budget") { RelaySources.select(emptyList(), listOf(source("large", RelayIceServer((1..33).map { "turn:host$it:3478" }, "u", "p")))) }
     }
 
@@ -90,4 +92,41 @@ class RelaySourcesTest {
         assertFalse(selected.toString().contains(secret))
         assertTrue(selected.sourcesForUrl("turn:unknown:3478").isEmpty())
     }
+    @Test fun eightSourcesExceedingTotalUrlsRetainNodeAndHighestPrioritySources() {
+        val node=listOf(RelayIceServer(listOf("stun:node:19302","turn:node:49100"),"node-user","node-pass"))
+        val extras=(1..7).map { i->RelaySource("s$i",listOf(RelayIceServer((1..6).map{"turn:s$i-$it:3478"},"u","p")),pinned=i==7,rankMillis=i.toLong()) }
+        val chosen=RelaySources.selectForCall(node,extras,nodeRank=100L)
+        assertTrue(chosen.truncated)
+        assertTrue(chosen.servers.sumOf{it.urls.size}<=RelaySources.MAX_URLS)
+        assertTrue(chosen.servers.size<=RelaySources.MAX_SERVERS)
+        assertEquals(extras.last().servers.single().urls,chosen.servers.first().urls)
+        assertTrue(chosen.servers.any{it.urls==node.single().urls&&it.username=="node-user"&&it.credential=="node-pass"})
+        assertTrue(chosen.sourcesForUrl("turn:s5-1:3478").isEmpty())
+        assertEquals(setOf(RelaySources.NODE_ID),chosen.sourcesForUrl("turn:node:49100"))
+    }
+    @Test fun invalidAdditionalConfigurationFallsBackOnlyAtTheCallBoundary() {
+        val node=listOf(RelayIceServer(listOf("stun:node:19302","turn:node:49100","turn:node:49100")))
+        val bad=listOf(source("invalid",server("https://not-a-turn-host")))
+        rejects("invalid_turn_scheme"){RelaySources.select(node,bad)}
+        val selected=RelaySources.selectForCall(node,bad)
+        assertEquals(node.single().urls,selected.servers.single().urls)
+        assertEquals("invalid_additional_configuration",selected.fallbackReason)
+        assertFalse(selected.hasAdditionalSources)
+    }
+    @Test fun oversizedLegacyNodeIsPreservedWhenNoExtrasFit() {
+        val node=(1..33).map{server("turn:node$it:3478")}
+        val selected=RelaySources.selectForCall(node,listOf(source("extra",server("turn:extra:3478"))))
+        assertEquals(node.map{it.urls},selected.servers.map{it.urls})
+        assertTrue(selected.truncated)
+    }
+
+    @Test fun pinnedPartialDuplicateCannotSplitNodeGroupsPastServerBudget() {
+        val node=(1..16).map{RelayIceServer(listOf("turn:node$it:3478","turn:backup$it:3478"),"u","p")}
+        val pinned=RelaySource("pinned",listOf(RelayIceServer(listOf("turn:node1:3478"),"u","p")),pinned=true)
+        val selected=RelaySources.selectForCall(node,listOf(pinned))
+        assertTrue(selected.truncated)
+        assertEquals(16,selected.servers.size)
+        assertEquals(node.flatMap{it.urls},selected.servers.flatMap{it.urls})
+    }
+
 }

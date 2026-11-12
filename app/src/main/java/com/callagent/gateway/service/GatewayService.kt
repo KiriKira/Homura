@@ -212,7 +212,10 @@ class GatewayService : Service() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "Network available")
                 // Do not wait out a prior offline retry backoff after connectivity returns.
-                if (wakeRuntimeAllowed()) wakeControlLoop()
+                if (wakeRuntimeAllowed()) {
+                    wakeControlLoop()
+                    CredentialStore.load(this@GatewayService)?.let{reconcileWakeConnection(it,recovery=true)}
+                }
                 logTransportIfChanged()
                 checkNetworkChanged()
                 refreshVoicePowerLease()
@@ -616,16 +619,17 @@ class GatewayService : Service() {
         startControlLoop()
     }
 
-    private fun reconcileWakeConnection(session: CredentialStore.Session) {
+    private fun reconcileWakeConnection(session: CredentialStore.Session, recovery:Boolean=false) {
         if (!wakeRuntimeAllowed()) {
             closeWakeConnection()
             return
         }
-        connectWakeSession(session)
+        connectWakeSession(session,recovery)
     }
 
+    // Set only by a server Retry-After, never by ordinary exponential retry.
     private var wakeRetryAt=0L
-    private fun connectWakeSession(session: CredentialStore.Session) {
+    private fun connectWakeSession(session: CredentialStore.Session, recovery:Boolean=false) {
         if(com.callagent.rtcmedia.NodeControlSocket.live(session.controlBaseUrl,session.accessToken)){
             com.callagent.rtcmedia.NodeControlSocket.listen(session.controlBaseUrl,"homura-primary"){
                 if(wakeRuntimeAllowed()&&CredentialStore.load(this)?.gatewayId==session.gatewayId)wakeControlLoop()
@@ -646,6 +650,7 @@ class GatewayService : Service() {
 
             if(android.os.SystemClock.elapsedRealtime()<wakeRetryAt)return
             val tokenChanged = currentIdentity != identity
+            if(!recovery&&!tokenChanged&&wakeRetryFuture!=null)return
             if (tokenChanged) {
                 wakeGeneration++
                 wakeIdentity = identity
@@ -738,8 +743,6 @@ class GatewayService : Service() {
             wakeConnection = null
             wakeGeneration++
             if (authorizationFailure) {
-                wakeRetryAt=android.os.SystemClock.elapsedRealtime()+wakeRetryMs
-                wakeRetryMs=(wakeRetryMs*2).coerceAtMost(WAKE_RETRY_MAX_MS)
                 wakeAuthBlocked = true
                 wakeAuthorizationTokenToRefresh = identity.tokenGeneration
                 wakeRetryFuture?.cancel(false)
@@ -781,7 +784,6 @@ class GatewayService : Service() {
         wakeRetryMs = (wakeRetryMs * 2).coerceAtMost(WAKE_RETRY_MAX_MS)
         val jitteredDelay = (baseDelay * ThreadLocalRandom.current().nextDouble(0.8, 1.2)).toLong()
             .coerceAtLeast(maxOf(1_000L,wakeRetryAt-android.os.SystemClock.elapsedRealtime()))
-        wakeRetryAt=android.os.SystemClock.elapsedRealtime()+jitteredDelay
         GatewayBackgroundRuntime.updateConnection(this, "HTTPS polling · WSS retrying")
         broadcastLog("CONTROL: WSS retry scheduled in ${jitteredDelay / 1000}s")
         wakeRetryFuture = try {
