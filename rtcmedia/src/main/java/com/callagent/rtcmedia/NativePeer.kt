@@ -23,7 +23,8 @@ internal class NativePeer(
     private val onEvent: (String) -> Unit,
     private val onDigit: (Char) -> Unit,
     private val onFailure: (String) -> Unit,
-    forceRelay: Boolean = false
+    forceRelay: Boolean = false,
+    private val relayOrigins: (String) -> Set<String> = { emptySet() }
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
@@ -233,7 +234,10 @@ internal class NativePeer(
             val local = report.statsMap[pair?.members?.get("localCandidateId") as? String]
             val remote = report.statsMap[pair?.members?.get("remoteCandidateId") as? String]
             val selected = "${local?.members?.get("candidateType")}/${remote?.members?.get("candidateType")}"
-            onEvent("stats selected_pair=$selected tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
+            val relaySource = if (local?.members?.get("candidateType") == "relay") {
+                (local.members["url"] as? String)?.let(relayOrigins)?.sorted()?.joinToString(",")?.ifEmpty { "unknown" } ?: "unknown"
+            } else if (local == null) "unknown" else "direct"
+            onEvent("stats selected_pair=$selected relay_sources=$relaySource tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
         }
     }
     override fun close(){

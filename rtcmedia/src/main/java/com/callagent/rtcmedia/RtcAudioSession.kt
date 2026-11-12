@@ -30,7 +30,8 @@ class RtcAudioSession(
     private val onDigit: (Char) -> Unit = {},
     private val onFailure: (String) -> Unit,
     private val onLog: (String) -> Unit = {},
-    private val forceRelay: Boolean = false
+    private val forceRelay: Boolean = false,
+    additionalRelaySources: List<RelaySource> = emptyList()
 ) : AutoCloseable {
     private val callControl = admission.optString("call_control", "sip")
     private val binding = admission.getJSONObject("binding")
@@ -39,15 +40,23 @@ class RtcAudioSession(
     private val attemptId = binding.getString("attempt_id")
     private val selfId = binding.getString(if (gateway) "gateway_id" else "client_id")
     private val remoteId = binding.getString(if (gateway) "client_id" else "gateway_id")
-    private val servers = buildList {
+    private val relaySelection = RelaySources.select(buildList {
         val items = admission.getJSONArray("ice_servers")
-        for(i in 0 until items.length()) {
-            val item=items.getJSONObject(i);val urls=item.getJSONArray("urls")
-            val builder=PeerConnection.IceServer.builder((0 until urls.length()).map(urls::getString))
-            if(item.has("username"))builder.setUsername(item.getString("username"))
-            if(item.has("credential"))builder.setPassword(item.getString("credential"))
-            add(builder.createIceServer())
+        for (i in 0 until items.length()) {
+            val item = items.getJSONObject(i)
+            val urls = item.getJSONArray("urls")
+            add(RelayIceServer((0 until urls.length()).map(urls::getString),
+                if (item.has("username")) item.getString("username") else null,
+                if (item.has("credential")) item.getString("credential") else null))
         }
+    }, additionalRelaySources).also {
+        if (additionalRelaySources.any { source -> source.enabled }) RelaySources.requireNativeCompatible(it)
+    }
+    private val servers = relaySelection.servers.map { item ->
+        PeerConnection.IceServer.builder(item.urls).apply {
+            item.username?.let(::setUsername)
+            item.credential?.let(::setPassword)
+        }.createIceServer()
     }
     private val worker=Executors.newSingleThreadScheduledExecutor { task -> Thread(task,"RTC-Signal-${callId.take(8)}") }
     private val closed=AtomicBoolean()
@@ -88,7 +97,7 @@ class RtcAudioSession(
         worker.execute {
             try {
                 if(closed.get())return@execute
-                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay)
+                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl)
                 if(closed.get()){native.close();return@execute};peer=native
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
                 event("native_ready elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")
