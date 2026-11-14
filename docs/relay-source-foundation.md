@@ -48,5 +48,6 @@ Madoka 另覆盖加密存储、账户/401 失效、7 来源共同截止时间，
 
 仍需 KVM 模拟器/真机：固定 SDK 的真实选路与来源归属、坏/慢 TURN、UDP 不通但 TLS 可用、当前节点 TURN 关闭、同址凭据媒体回退、
 长振铃接听/预取取消、双主机与蜂窝 END 竞态、Doze/网络切换/重连风暴。当前环境无 `/dev/kvm`，未把 JVM 测试当成媒体通话验收。
+来源准备耗时以日志 `event=relay_sources_resolved elapsed_ms=... sources=...` 为准：它覆盖获取凭据和 STUN 测速，`native_ready`/`offer_sent` 的计时不包含这一段。
 设备验收还需记录节点单来源及多来源的外呼/接听媒体就绪耗时：来源刷新最多 1.5 秒，同址凭据认证最多另加 1.2 秒，单节点 STUN 测速最多 250ms（按网络缓存 5 分钟）；Homura 两个方向均无预取，Madoka 仅来电振铃预取。
 真实 Cloudflare 的 Deploy、key 权限、已有 allocation 撤销效果与 24 小时用量还需部署者账号验证；本批没有发布生产 Worker。

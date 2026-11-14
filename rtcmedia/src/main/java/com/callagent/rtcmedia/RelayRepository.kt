@@ -92,6 +92,14 @@ object RelayRepository {
         val item=items.getJSONObject(index);val urls=item.getJSONArray("urls")
         RelayIceServer((0 until urls.length()).map(urls::getString),if(item.has("username"))item.getString("username")else null,if(item.has("credential"))item.getString("credential")else null)
     }
+    /** [resolve] for one call, logging only its duration and source count: the
+     * interval media diagnostics (native_ready, offer_sent) cannot see. */
+    fun resolveForCall(context:Context,scope:String,callId:String,currentNodeId:String?=null,nodeServers:List<RelayIceServer> = emptyList()):List<RelaySource> {
+        val started=System.nanoTime()
+        val sources=resolve(context,scope,currentNodeId,nodeServers)
+        runCatching{android.util.Log.i("GsmRtc","media=webrtc call_id=$callId event=relay_sources_resolved elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started)} sources=${sources.size}")}
+        return sources
+    }
     /** Called off the UI thread after admission, with one total 1.5 s refresh deadline. */
     fun resolve(context:Context,scope:String,currentNodeId:String?=null,nodeServers:List<RelayIceServer> = emptyList()):List<RelaySource> {
         synchronized(this){if(account!=scope){account=scope;cache.clear()}}
