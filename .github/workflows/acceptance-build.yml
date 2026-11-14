@@ -70,9 +70,11 @@ jobs:
           import json
           from pathlib import Path
           info = json.loads(Path("BUILD-INFO.json").read_text())
-          bad = {k: v["abis"] for k, v in info["apks"].items() if "x86_64" not in v["abis"]}
-          assert not bad, f"missing x86_64: {bad}"
-          print("x86_64 present in all APKs")
+          # only the app APK carries native libs; an androidTest APK has no lib/ by design
+          app = {k: v["abis"] for k, v in info["apks"].items() if "/androidTest/" not in k}
+          bad = {k: v for k, v in app.items() if "x86_64" not in v}
+          assert not bad, f"missing x86_64 in app APK: {bad}"
+          print("x86_64 present in app APK; androidTest APKs carry no native libs (expected)")
           PY
 
       - name: Stage
