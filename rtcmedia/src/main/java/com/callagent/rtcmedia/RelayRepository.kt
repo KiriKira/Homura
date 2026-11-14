@@ -72,7 +72,7 @@ object RelayRepository {
     fun parseLink(value:String):JSONObject {
         require(value.length<=4096){"invalid_relay_link"}
         val uri=try{URI(value)}catch(_:Exception){throw IllegalArgumentException("invalid_relay_link")}
-        require(uri.scheme=="gsm2sip"&&uri.host=="relay"&&uri.fragment==null&&uri.path.orEmpty().isEmpty()&&uri.rawUserInfo==null&&uri.port==-1){"invalid_relay_link"}
+        require(uri.scheme=="mahogsm"&&uri.host=="relay"&&uri.fragment==null&&uri.path.orEmpty().isEmpty()&&uri.rawUserInfo==null&&uri.port==-1){"invalid_relay_link"}
         val params=uri.rawQuery.orEmpty().split('&').map { part->
             require(part.contains('=')){"invalid_relay_link"}
             java.net.URLDecoder.decode(part.substringBefore('='),"UTF-8") to java.net.URLDecoder.decode(part.substringAfter('='),"UTF-8")

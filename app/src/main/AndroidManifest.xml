@@ -81,7 +81,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="gsm2sip" android:host="relay" />
+                <data android:scheme="mahogsm" android:host="relay" />
             </intent-filter>
         </activity>
         <activity

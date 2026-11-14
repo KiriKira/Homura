@@ -40,7 +40,7 @@ class RelaySettingsActivity:Activity() {
     }
     private fun change(update:(JSONArray)->Unit){try{val items=RelayRepository.load(this);update(items);RelayRepository.save(this,items);render()}catch(_:Exception){message("保存失败，请检查来源数量或存储状态")}}
     private fun formLink(){
-        val field=EditText(this).apply{hint="gsm2sip://relay?...";inputType=InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD;maxLines=4}
+        val field=EditText(this).apply{hint="mahogsm://relay?...";inputType=InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD;maxLines=4}
         val dialog=AlertDialog.Builder(this).setTitle("添加来源链接").setView(field).setPositiveButton("添加",null).setNegativeButton("取消",null).create()
         dialog.setOnShowListener{dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener{try{val item=RelayRepository.parseLink(field.text.toString());change{it.put(item)};dialog.dismiss()}catch(_:Exception){message("请输入有效的 HTTPS 来源配对链接")}}};dialog.show()
     }

@@ -5,7 +5,7 @@
 ## 来源与排序
 
 设置入口“中继来源”支持静态 TURN、已配对节点和 HTTPS 来源链接/二维码；来源可以关闭、单独置顶或移除。
-`gsm2sip://relay?url=...&token=...` 明确确认后才保存/访问；HTTPS、参数唯一性、端口和 token 边界严格检查。
+`mahogsm://relay?url=...&token=...` 明确确认后才保存/访问；HTTPS、参数唯一性、端口和 token 边界严格检查。
 节点声明 `ice_servers_v1` 时复用其原会话，不另发 Cloudflare API token。来源列表用 Android Keystore AES/GCM 加密，既有备份规则排除全部私有配置。
 存储损坏要求显式清除重建；通话仍可使用节点准入。账户、会话身份、配置代际隔离凭据缓存；401/403 清除来源缓存，不以旧凭据回退。
 
