@@ -7,6 +7,9 @@ on:
         description: why this build
         required: false
         default: acceptance
+      runner:
+        description: lab instrumentation class (AGP overwrites the manifest's first entry)
+        required: true
 
 permissions:
   contents: read
@@ -38,7 +41,7 @@ jobs:
           set -euo pipefail
           RELAY=""
           if [ "${{ matrix.variant }}" = "relay" ]; then RELAY="-PforceRtcRelay=true"; fi
-          ./gradlew -PrtcEmulator=true $RELAY \
+          ./gradlew -PrtcEmulator=true $RELAY -PrtcLabRunner="${{ inputs.runner }}" \
             :app:assembleDebug :app:assembleDebugAndroidTest \
             --no-daemon --max-workers=2
 
@@ -76,6 +79,19 @@ jobs:
           assert not bad, f"missing x86_64 in app APK: {bad}"
           print("x86_64 present in app APK; androidTest APKs carry no native libs (expected)")
           PY
+
+      - name: Assert lab runner is registered in the androidTest manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          AAPT2=$(find "$SDK/build-tools" -name aapt2 | sort | tail -1)
+          "$AAPT2" dump xmltree --file AndroidManifest.xml \
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk > /tmp/m.xml
+          grep -q 'instrumentation' /tmp/m.xml || { echo "no instrumentation node"; exit 1; }
+          NAMES=$(grep -A3 'E: instrumentation' /tmp/m.xml | grep 'android:name' | sed 's/.*="\(.*\)"/\1/')
+          echo "registered: $NAMES"
+          echo "$NAMES" | grep -q '${{ inputs.runner }}' || { echo "runner ${{ inputs.runner }} NOT registered"; exit 1; }
 
       - name: Stage
         shell: bash
