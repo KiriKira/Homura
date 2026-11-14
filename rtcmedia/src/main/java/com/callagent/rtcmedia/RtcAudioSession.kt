@@ -53,7 +53,7 @@ class RtcAudioSession(
     }
     private val nodeRelayPolicy=RelayRepository.nodePolicy(context,currentRelayNodeId)
     private val relaySelection=RelaySources.selectForCall(if(nodeRelayPolicy.first)nodeServers else emptyList(),additionalRelaySources,RelayRepository.cachedRank(context,nodeServers),nodeRelayPolicy.second).let{TurnCredentials.resolve(it,onEvent=::event)}
-    private val relayDiagnostics=RelayGatheringDiagnostics(forceRelay,nodeServers,nodeRelayPolicy.first,additionalRelaySources,relaySelection)
+    private val relayDiagnostics=RelayGatheringDiagnostics(nodeServers,nodeRelayPolicy.first,additionalRelaySources,relaySelection)
     private val servers = relaySelection.servers.map { item ->
         PeerConnection.IceServer.builder(item.urls).apply {
             item.username?.let(::setUsername)
@@ -101,7 +101,7 @@ class RtcAudioSession(
             try {
                 if(lifecycle.isClosed)return@execute
                 val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay,relaySelection::sourcesForUrl,relaySelection.hasAdditionalSources,
-                    { count -> relayDiagnostics.completed(count)?.let(::event) })
+                    { count -> if(!lifecycle.isClosed)relayDiagnostics.completed(forceRelay,count)?.let(::event) })
                 if(!lifecycle.install(native))return@execute
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
                 event("native_ready elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")

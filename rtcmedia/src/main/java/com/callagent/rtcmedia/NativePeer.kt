@@ -33,6 +33,8 @@ internal class NativePeer(
     private val localCandidates = LocalIceQueue<IceCandidate>()
     private val candidateBudget=CandidateBudget()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
+    // Count native callbacks before trickle filtering; diagnostics concern actual gathering.
+    private val gatheredCandidateCount = java.util.concurrent.atomic.AtomicInteger()
     val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
     fun takeCandidates(): LocalIceQueue.Batch<IceCandidate> = localCandidates.drain()
     private val lock = Any()
@@ -112,9 +114,10 @@ internal class NativePeer(
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 onEvent("gathering_${state.name.lowercase()}")
-                if(state==PeerConnection.IceGatheringState.COMPLETE && !closed.get())onGatheringComplete(candidateCount.get())
+                if(state==PeerConnection.IceGatheringState.COMPLETE && !closed.get())onGatheringComplete(gatheredCandidateCount.get())
             }
             override fun onIceCandidate(candidate: IceCandidate) {
+                gatheredCandidateCount.incrementAndGet()
                 if(multipleSources && !candidateBudget.accept(candidate.sdp)){onEvent("local_candidate_filtered_budget");return}
                 if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }
                 if (!localCandidates.add(candidate)) onEvent("late_local_candidate_ignored")

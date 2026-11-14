@@ -7,26 +7,27 @@ import java.util.concurrent.atomic.AtomicLong
 /** Bounded mono PCM16 adapter. Cellular side supplies 20 ms at 8/16 kHz;
  * WebRTC pulls/pushes 10 ms at 16 kHz. There is no microphone/speaker fallback. */
 class PcmBridge {
-    // Preserve the existing 12 x 10 ms = 120 ms latency bound. Overflow
-    // drops the oldest 10 ms block, never silently rejects a new block.
+    // Twelve 10 ms blocks = 120 ms. Keep the latency bound; do not hide overruns.
     private val captureLock = Any()
-    private val captured = ArrayDeque<ByteArray>(12)
+    private val captured = ArrayDeque<ByteArray>(CAPTURE_BLOCKS)
     private var pendingPlayout: ByteArray? = null
     @Volatile var onDecodedFrame: ((ByteArray) -> Unit)? = null
     val captureFrames = AtomicLong()
     val decodedFrames = AtomicLong()
     val underruns = AtomicLong()
-    /** Number of 10 ms blocks actually discarded by capture overflow (not clear). */
+    /** Number of 10 ms blocks evicted under capture pressure, not 20 ms input frames.
+     * Explicit clear() teardown is not an overrun. New blocks are never dropped. */
     val overruns = AtomicLong()
 
     fun capture(frame: ByteArray, sampleRate: Int) {
         require(sampleRate == 8000 || sampleRate == 16000)
         require(frame.size == sampleRate / 50 * 2)
         val pcm = if (sampleRate == 16000) frame else upsample(frame)
+        val first = pcm.copyOfRange(0, 320)
+        val second = pcm.copyOfRange(320, 640)
         synchronized(captureLock) {
-            for (offset in intArrayOf(0, 320)) {
-                val block = pcm.copyOfRange(offset, offset + 320)
-                if (captured.size == 12) {
+            for (block in arrayOf(first, second)) {
+                if (captured.size == CAPTURE_BLOCKS) {
                     captured.removeFirst()
                     overruns.incrementAndGet()
                 }
@@ -52,7 +53,10 @@ class PcmBridge {
         else { pendingPlayout = null; onDecodedFrame?.invoke(previous + data) }
     }
 
-    @Synchronized fun clear() { synchronized(captureLock) { captured.clear() }; pendingPlayout = null; onDecodedFrame = null }
+    @Synchronized fun clear() {
+        synchronized(captureLock) { captured.clear() }
+        pendingPlayout = null; onDecodedFrame = null
+    }
 
     private fun upsample(input: ByteArray): ByteArray {
         val out = ByteArray(input.size * 2)
@@ -67,5 +71,5 @@ class PcmBridge {
     }
     private fun sample(data: ByteArray, i: Int) = (data[i*2].toInt() and 255) or (data[i*2+1].toInt() shl 8)
     private fun put(data: ByteArray, i: Int, value: Int) { data[i*2]=value.toByte();data[i*2+1]=(value shr 8).toByte() }
-    private companion object { val SILENCE = ByteArray(320) }
+    private companion object { const val CAPTURE_BLOCKS = 12; val SILENCE = ByteArray(320) }
 }

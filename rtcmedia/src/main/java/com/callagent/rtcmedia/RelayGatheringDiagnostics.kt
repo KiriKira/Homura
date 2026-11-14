@@ -1,33 +1,34 @@
 package com.callagent.rtcmedia
 
-import java.util.concurrent.atomic.AtomicBoolean
-
-/** Configuration counts only: never render URLs, source tokens or credentials. */
+/** Configuration counts only: never retain or log URLs, credentials, tokens or source names.
+ * No candidates proves that relay ICE is unusable, not why a TURN transaction failed. */
 internal class RelayGatheringDiagnostics(
-    private val forceRelay: Boolean,
-    node: List<RelayIceServer>,
-    nodeEnabled: Boolean,
-    additional: List<RelaySource>,
-    selected: RelaySelection
+    nodeServers: List<RelayIceServer>,
+    private val nodeEnabled: Boolean,
+    additionalSources: List<RelaySource>,
+    selection: RelaySelection
 ) {
-    private val reported = AtomicBoolean()
-    private val details: String
+    private val nodeSources = if (nodeServers.isEmpty()) 0 else 1
+    private val nodeServerCount = nodeServers.size
+    private val externalConfigured = additionalSources.size
+    private val externalEnabled = additionalSources.count { it.enabled }
+    private val externalSelected: Int
+    private val selectedTurnUrls: Int
     init {
-        val selectedUrls = selected.servers.flatMap { it.urls }.distinct()
-        val nodeTurnUrls = node.flatMap { it.urls }.filter(::isTurn).distinct()
-        val selectedTurnUrls = selectedUrls.filter(::isTurn)
-        val sources = selectedTurnUrls.flatMap { selected.sourcesForUrl(it) }.toSet()
-        details = "external_configured=${additional.isNotEmpty()} external_sources=${additional.size}" +
-            " external_enabled_sources=${additional.count { it.enabled }}" +
-            " node_enabled=$nodeEnabled node_sources=${if(nodeTurnUrls.isEmpty())0 else 1}" +
-            " node_servers=${node.size} node_turn_urls=${nodeTurnUrls.size}" +
-            " selected_sources=${sources.size} selected_turn_urls=${selectedTurnUrls.size}"
+        val selectedUrls = selection.servers.flatMap { it.urls }.toSet()
+        externalSelected = selectedUrls.flatMap { selection.sourcesForUrl(it) }
+            .filter { it != RelaySources.NODE_ID }.toSet().size
+        selectedTurnUrls = selectedUrls.count {
+            it.startsWith("turn:", ignoreCase = true) || it.startsWith("turns:", ignoreCase = true)
+        }
     }
-    fun completed(localCandidates: Int): String? {
-        if (!forceRelay || localCandidates != 0 || !reported.compareAndSet(false, true)) return null
-        // Gathering proves absence of local candidates, NOT that credentials,
-        // connectivity or quota is the specific cause. Probe events refine it.
-        return "relay_no_local_candidates force_relay=true local_candidates=0 $details"
+
+    fun completed(forceRelay: Boolean, localCandidates: Int): String? {
+        if (!forceRelay || localCandidates != 0) return null
+        val reason = if (selectedTurnUrls == 0) "no_turn_servers_configured" else "turn_candidates_unavailable"
+        return "relay_no_local_candidates reason=$reason force_relay=true local_candidates=0" +
+            " external_sources_configured=$externalConfigured external_sources_enabled=$externalEnabled" +
+            " external_sources_selected=$externalSelected node_sources_configured=$nodeSources" +
+            " node_servers_configured=$nodeServerCount node_enabled=$nodeEnabled selected_turn_urls=$selectedTurnUrls"
     }
-    private fun isTurn(url: String) = url.startsWith("turn:") || url.startsWith("turns:")
 }
