@@ -261,6 +261,9 @@ class CallOrchestrator(
             check(binding.getString("call_id") == id && binding.getString("gateway_id") == leg.node.gatewayId &&
                 binding.getString("sim_id") == snapshot.getString("sim_id") && binding.getLong("mapping_revision") == snapshot.getLong("mapping_revision")) { "RTC_MEDIA_BINDING_CHANGED" }
             val media = RtcAudioSession(context, authorized, leg.node.api, true, pcm,
+                forceRelay=com.callagent.gateway.BuildConfig.FORCE_RTC_RELAY,
+                currentRelayNodeId="node-"+binding.getString("gateway_id"),
+                additionalRelaySources = com.callagent.rtcmedia.RelayRepository.resolveForCall(context, binding.getString("owner_id"), id, "node-"+binding.getString("gateway_id"),nodeServers=com.callagent.rtcmedia.RelayRepository.servers(authorized.getJSONArray("ice_servers"))),
                 onDigit = { digit -> receiveRtcDigit(digit, gen) }, onFailure = { reason ->
                     if (reason == "server_authorization_closed") {
                         // Control state owns the cellular call; media closure can race ahead of

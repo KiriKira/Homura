@@ -46,10 +46,12 @@ data class MeshHeartbeatInputs(
 class MeshCoordinator(
     context: Context,
     private val processCommands: (ControlApiClient, GatewayDatabase) -> Unit,
+    private val wake: () -> Unit,
     private val log: (String) -> Unit
 ) {
     private val app = context.applicationContext
     private val database = GatewayDatabase.get(app)
+    private val heartbeatAt=mutableMapOf<String,Long>()
 
     /** Sync every node independently; one unreachable node never blocks another. */
     fun syncAll(inputs: MeshHeartbeatInputs): Boolean {
@@ -77,7 +79,11 @@ class MeshCoordinator(
         val client = ControlApiClient(app, node.controlBaseUrl, vault)
         val snapshot = SimRegistry.snapshot(app)
         ensureBindings(node, client, snapshot)
-        heartbeat(node, client, snapshot, inputs)
+        com.callagent.rtcmedia.NodeControlSocket.listen(node.controlBaseUrl,"homura-mesh-"+node.gatewayId,wake)
+        val now=android.os.SystemClock.elapsedRealtime()
+        if(!com.callagent.rtcmedia.NodeControlSocket.supports(node.controlBaseUrl,"cold_standby_v1")||now-(heartbeatAt[node.gatewayId]?:-60_000L)>=60_000L){
+            heartbeat(node,client,snapshot,inputs);heartbeatAt[node.gatewayId]=now
+        }
         database.emitAliasEvents(node.gatewayId)
         val events = database.pendingMeshEvents(node.gatewayId)
         if (events.isNotEmpty()) {
@@ -207,6 +213,7 @@ object MeshPairing {
         val node = database.meshNodes().firstOrNull { it.gatewayId == gatewayId }
         val vault = MeshVaults.forNode(gatewayId)
         if (node != null) runCatching { ControlApiClient(app, node.controlBaseUrl, vault).revoke() }
+        com.callagent.rtcmedia.NodeControlSocket.unlisten("homura-mesh-"+gatewayId)
         database.removeMeshNode(gatewayId)
         vault.clear(app)
     }

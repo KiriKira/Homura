@@ -16,6 +16,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
+        buildConfigField("boolean", "FORCE_RTC_RELAY", "false")
         testInstrumentationRunner = providers.gradleProperty("rtcLabRunner").orElse("androidx.test.runner.AndroidJUnitRunner").get()
         applicationId = "com.callagent.gateway"
         minSdk = 26
@@ -38,6 +39,10 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            buildConfigField("boolean", "FORCE_RTC_RELAY", providers.gradleProperty("forceRtcRelay").orElse("false").get().toBoolean().toString())
+            if(providers.gradleProperty("rtcEmulator").orElse("false").get().toBoolean())ndk { abiFilters += setOf("arm64-v8a","x86_64") }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -69,6 +74,7 @@ dependencies {
         .builtBy(":rtcmedia:prepareWebRtcSdk"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("org.robolectric:robolectric:4.12.2")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.0")

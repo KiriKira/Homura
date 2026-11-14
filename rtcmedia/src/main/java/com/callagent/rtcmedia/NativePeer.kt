@@ -23,12 +23,18 @@ internal class NativePeer(
     private val onEvent: (String) -> Unit,
     private val onDigit: (Char) -> Unit,
     private val onFailure: (String) -> Unit,
-    forceRelay: Boolean = false
+    forceRelay: Boolean = false,
+    private val relayOrigins: (String) -> Set<String> = { emptySet() },
+    private val multipleSources:Boolean=false,
+    private val onGatheringComplete:(Int)->Unit={}
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
     private val localCandidates = LocalIceQueue<IceCandidate>()
+    private val candidateBudget=CandidateBudget()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
+    // Count native callbacks before trickle filtering; diagnostics concern actual gathering.
+    private val gatheredCandidateCount = java.util.concurrent.atomic.AtomicInteger()
     val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
     fun takeCandidates(): LocalIceQueue.Batch<IceCandidate> = localCandidates.drain()
     private val lock = Any()
@@ -108,8 +114,11 @@ internal class NativePeer(
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 onEvent("gathering_${state.name.lowercase()}")
+                if(state==PeerConnection.IceGatheringState.COMPLETE && !closed.get())onGatheringComplete(gatheredCandidateCount.get())
             }
             override fun onIceCandidate(candidate: IceCandidate) {
+                gatheredCandidateCount.incrementAndGet()
+                if(multipleSources && !candidateBudget.accept(candidate.sdp)){onEvent("local_candidate_filtered_budget");return}
                 if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }
                 if (!localCandidates.add(candidate)) onEvent("late_local_candidate_ignored")
             }
@@ -233,14 +242,21 @@ internal class NativePeer(
             val local = report.statsMap[pair?.members?.get("localCandidateId") as? String]
             val remote = report.statsMap[pair?.members?.get("remoteCandidateId") as? String]
             val selected = "${local?.members?.get("candidateType")}/${remote?.members?.get("candidateType")}"
-            onEvent("stats selected_pair=$selected tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
+            val relaySource = if (local?.members?.get("candidateType") == "relay") {
+                (local.members["url"] as? String)?.let(relayOrigins)?.sorted()?.joinToString(",")?.ifEmpty { "unknown" } ?: "unknown"
+            } else if (local == null) "unknown" else "direct"
+            onEvent("stats selected_pair=$selected relay_sources=$relaySource tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
         }
     }
     override fun close(){
         if(!closed.compareAndSet(false,true))return
         synchronized(lock){
             controls.getAndSet(null)?.let{runCatching{it.unregisterObserver();it.close();it.dispose()}}
-            runCatching{peer.setAudioRecording(false);peer.setAudioPlayout(false);peer.close();peer.dispose()}
+            // A failure disabling audio must not skip TURN/native disposal.
+            runCatching{peer.setAudioRecording(false)}
+            runCatching{peer.setAudioPlayout(false)}
+            runCatching{peer.close()}
+            runCatching{peer.dispose()}
             runCatching{track.dispose()};runCatching{source.dispose()};runCatching{factory.dispose()};runCatching{module.release()}
         }
         scheduler.shutdownNow();pcm?.clear();onEvent("native_closed")
