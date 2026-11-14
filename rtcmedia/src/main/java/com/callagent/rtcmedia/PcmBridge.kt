@@ -1,28 +1,36 @@
 package com.callagent.rtcmedia
 
 import java.nio.ByteBuffer
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 
 /** Bounded mono PCM16 adapter. Cellular side supplies 20 ms at 8/16 kHz;
  * WebRTC pulls/pushes 10 ms at 16 kHz. There is no microphone/speaker fallback. */
 class PcmBridge {
-    private val captured = ArrayBlockingQueue<ByteArray>(12)
+    // Preserve the existing 12 x 10 ms = 120 ms latency bound. Overflow
+    // drops the oldest 10 ms block, never silently rejects a new block.
+    private val captureLock = Any()
+    private val captured = ArrayDeque<ByteArray>(12)
     private var pendingPlayout: ByteArray? = null
     @Volatile var onDecodedFrame: ((ByteArray) -> Unit)? = null
     val captureFrames = AtomicLong()
     val decodedFrames = AtomicLong()
     val underruns = AtomicLong()
+    /** Number of 10 ms blocks actually discarded by capture overflow (not clear). */
     val overruns = AtomicLong()
 
     fun capture(frame: ByteArray, sampleRate: Int) {
         require(sampleRate == 8000 || sampleRate == 16000)
         require(frame.size == sampleRate / 50 * 2)
         val pcm = if (sampleRate == 16000) frame else upsample(frame)
-        for (offset in intArrayOf(0, 320)) {
-            val block = pcm.copyOfRange(offset, offset + 320)
-            if (!captured.offer(block)) {
-                captured.poll(); captured.offer(block); overruns.incrementAndGet()
+        synchronized(captureLock) {
+            for (offset in intArrayOf(0, 320)) {
+                val block = pcm.copyOfRange(offset, offset + 320)
+                if (captured.size == 12) {
+                    captured.removeFirst()
+                    overruns.incrementAndGet()
+                }
+                captured.addLast(block)
             }
         }
     }
@@ -30,7 +38,7 @@ class PcmBridge {
     fun fill(buffer: ByteBuffer, format: Int, channels: Int, sampleRate: Int) {
         require(format == 2 && channels == 1 && sampleRate == 16000 && buffer.capacity() == 320)
         buffer.clear()
-        val block = captured.poll()
+        val block = synchronized(captureLock) { captured.pollFirst() }
         if (block == null) { underruns.incrementAndGet(); buffer.put(SILENCE) }
         else { buffer.put(block); captureFrames.incrementAndGet() }
         buffer.rewind()
@@ -44,7 +52,7 @@ class PcmBridge {
         else { pendingPlayout = null; onDecodedFrame?.invoke(previous + data) }
     }
 
-    @Synchronized fun clear() { captured.clear(); pendingPlayout = null; onDecodedFrame = null }
+    @Synchronized fun clear() { synchronized(captureLock) { captured.clear() }; pendingPlayout = null; onDecodedFrame = null }
 
     private fun upsample(input: ByteArray): ByteArray {
         val out = ByteArray(input.size * 2)
