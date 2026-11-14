@@ -25,7 +25,8 @@ internal class NativePeer(
     private val onFailure: (String) -> Unit,
     forceRelay: Boolean = false,
     private val relayOrigins: (String) -> Set<String> = { emptySet() },
-    private val multipleSources:Boolean=false
+    private val multipleSources:Boolean=false,
+    private val onGatheringComplete:(Int)->Unit={}
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
@@ -111,6 +112,7 @@ internal class NativePeer(
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 onEvent("gathering_${state.name.lowercase()}")
+                if(state==PeerConnection.IceGatheringState.COMPLETE && !closed.get())onGatheringComplete(candidateCount.get())
             }
             override fun onIceCandidate(candidate: IceCandidate) {
                 if(multipleSources && !candidateBudget.accept(candidate.sdp)){onEvent("local_candidate_filtered_budget");return}
@@ -247,7 +249,11 @@ internal class NativePeer(
         if(!closed.compareAndSet(false,true))return
         synchronized(lock){
             controls.getAndSet(null)?.let{runCatching{it.unregisterObserver();it.close();it.dispose()}}
-            runCatching{peer.setAudioRecording(false);peer.setAudioPlayout(false);peer.close();peer.dispose()}
+            // A failure disabling audio must not skip TURN/native disposal.
+            runCatching{peer.setAudioRecording(false)}
+            runCatching{peer.setAudioPlayout(false)}
+            runCatching{peer.close()}
+            runCatching{peer.dispose()}
             runCatching{track.dispose()};runCatching{source.dispose()};runCatching{factory.dispose()};runCatching{module.release()}
         }
         scheduler.shutdownNow();pcm?.clear();onEvent("native_closed")
