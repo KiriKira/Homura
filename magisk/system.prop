@@ -1,0 +1,4 @@
+# Generic Magisk runtime does not apply vendor audio properties globally.
+# Previous versions forced Qualcomm/Exynos concurrency and processing flags
+# on every device. Audio now uses actual capabilities and an explicit local
+# profile; this file intentionally declares no property overrides.

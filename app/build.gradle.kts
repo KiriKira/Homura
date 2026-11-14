@@ -1,0 +1,88 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+val releaseVersionCode = providers.environmentVariable("GSM_RELEASE_VERSION_CODE").orNull?.let {
+    requireNotNull(it.toIntOrNull()) { "GSM_RELEASE_VERSION_CODE must be an integer" }
+} ?: 430
+require(releaseVersionCode in 1..2_100_000_000) {
+    "GSM_RELEASE_VERSION_CODE must be in Android's supported range 1..2100000000"
+}
+val releaseVersionName = providers.environmentVariable("GSM_RELEASE_VERSION_NAME").orNull ?: "0.4.2-dev"
+
+android {
+    namespace = "com.callagent.gateway"
+    compileSdk = 35
+
+    defaultConfig {
+        buildConfigField("boolean", "FORCE_RTC_RELAY", "false")
+        testInstrumentationRunner = providers.gradleProperty("rtcLabRunner").orElse("androidx.test.runner.AndroidJUnitRunner").get()
+        applicationId = "com.callagent.gateway"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = releaseVersionCode
+        versionName = releaseVersionName
+    }
+
+    // Release identity is supplied outside the repository and persists across upgrades.
+    val releaseStore = providers.environmentVariable("GSM_RELEASE_STORE_FILE").orNull
+    signingConfigs {
+        if (!releaseStore.isNullOrBlank()) {
+            create("production") {
+                storeFile = file(releaseStore)
+                storePassword = providers.environmentVariable("GSM_RELEASE_STORE_PASSWORD").orNull
+                keyAlias = providers.environmentVariable("GSM_RELEASE_KEY_ALIAS").orNull
+                keyPassword = providers.environmentVariable("GSM_RELEASE_KEY_PASSWORD").orNull
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            buildConfigField("boolean", "FORCE_RTC_RELAY", providers.gradleProperty("forceRtcRelay").orElse("false").get().toBoolean().toString())
+            if(providers.gradleProperty("rtcEmulator").orElse("false").get().toBoolean())ndk { abiFilters += setOf("arm64-v8a","x86_64") }
+        }
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (!releaseStore.isNullOrBlank()) signingConfig = signingConfigs.getByName("production")
+        }
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+}
+
+dependencies {
+    implementation(project(":rtcmedia"))
+    implementation(files(rootProject.project(":rtcmedia").layout.buildDirectory.file("webrtc-sdk/external-playout.aar"))
+        .builtBy(":rtcmedia:prepareWebRtcSdk"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.robolectric:robolectric:4.12.2")
+    implementation("androidx.core:core-ktx:1.16.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.lifecycle:lifecycle-livedata-core:2.8.7") {
+        version { strictly("2.8.7") }
+    }
+    implementation("androidx.window:window:1.5.1")
+    implementation("androidx.window:window-java:1.5.1")
+    implementation("com.google.android.material:material:1.14.0")
+    implementation("androidx.constraintlayout:constraintlayout:2.2.1")
+}

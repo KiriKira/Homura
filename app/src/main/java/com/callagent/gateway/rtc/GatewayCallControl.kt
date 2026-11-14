@@ -1,0 +1,208 @@
+package com.callagent.gateway.rtc
+
+import android.content.Context
+import android.os.SystemClock
+import android.util.Log
+import com.callagent.gateway.data.CredentialStore
+import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.data.SessionSource
+import com.callagent.gateway.mesh.MeshVaults
+import com.callagent.gateway.net.ControlApiClient
+import com.callagent.gateway.bridge.CallOrchestrator
+import com.callagent.gateway.sim.SimRegistry
+import com.callagent.rtcmedia.*
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+private const val LIVE_POLL_MS=250L
+private const val IDLE_POLL_NANOS=750_000_000L
+private val SETTING_UP=setOf("reserved","pending_wakeup","ringing","dialing","connecting")
+
+/** Per-node authenticated control loops. They share exactly one physical
+ * orchestrator, SIM validator, occupancy and durable cellular executor. */
+class GatewayCallControl(private val context: Context, private val orchestrator: CallOrchestrator) : AutoCloseable {
+    class Node(val gatewayId: String, val api: MediaApi, val control: RtcCallControl, val primary: Boolean) {
+        @Volatile var ready = false
+        @Volatile var checked = false
+        @Volatile var supported = false
+        /** The node advertises reception_v2: it takes remaining_ring_ms and
+         * answers NO_INCOMING_SUBSCRIBERS. */
+        @Volatile var receptionV2 = false
+        /** The node advertises global_decline_v1: a host there can decline a
+         * call for every host, which this gateway decides and reports. */
+        @Volatile var globalDecline = false
+        /** The node advertises incoming_ring_until_end: its hosts ring until the cellular call ends. */
+        @Volatile var ringUntilEnd = false
+        @Volatile var lastSeen = System.nanoTime()
+        var capabilityAt = 0L
+        var cheapControl = false
+        var renewalAt = 0L
+        /** The last poll saw a call still being set up: poll at the fast cadence. */
+        @Volatile var liveCalls = false
+        var lastPollAt = 0L
+    }
+    private val closed=AtomicBoolean()
+    private val nodes=ConcurrentHashMap<String,Node>()
+    private val workers=ConcurrentHashMap<String,java.util.concurrent.ScheduledExecutorService>()
+    private val incomingOffers=ConcurrentHashMap<String,IncomingForkCoordinator>()
+    private val reconciler=Executors.newSingleThreadScheduledExecutor { Thread(it,"RTC-Gateway-Nodes") }
+    val ready: Boolean get()=nodes.values.any{it.ready}
+    fun start(){reconciler.scheduleWithFixedDelay(::reconcile,0,10,TimeUnit.SECONDS)}
+    private fun reconcile(){
+        if(closed.get())return
+        val sources=buildList<Pair<SessionSource,Boolean>>{
+            add(CredentialStore to true)
+            GatewayDatabase.get(context).meshNodes().forEach{add(MeshVaults.forNode(it.gatewayId) to false)}
+        }
+        val wanted=hashSetOf<String>()
+        sources.forEach{(vault,primary)->
+            val session=runCatching{vault.load(context)}.getOrNull()?:return@forEach
+            wanted.add(session.gatewayId)
+            if(nodes.containsKey(session.gatewayId))return@forEach
+            val client=ControlApiClient(context,session.controlBaseUrl,vault,3000)
+            val api=MediaApi{method,path,body->client.rtcRequest(method,path,body)}
+            RelayRepository.registerNode("node-"+session.gatewayId,"节点 "+java.net.URI(session.controlBaseUrl).host){
+                val bounded=ControlApiClient(context,session.controlBaseUrl,vault,600)
+                try{if(bounded.capabilityFlags().optBoolean("ice_servers_v1"))bounded.rtcRequest("GET","/rtc/ice-servers",null) else null}catch(e:com.callagent.gateway.net.ControlApiException){throw MediaApiException(e.httpStatus,e.code)}
+            }
+            val node=Node(session.gatewayId,api,RtcCallControl(api),primary)
+            nodes[node.gatewayId]=node
+            val worker=Executors.newSingleThreadScheduledExecutor{Thread(it,"RTC-Gateway-${node.gatewayId.take(8)}")}
+            workers[node.gatewayId]=worker
+            // While a call is being set up, poll every 250 ms so a host's answer
+            // and its media reach the gateway sooner. Otherwise stay at 750 ms.
+            worker.scheduleWithFixedDelay({
+                val live=node.liveCalls || incomingOffers.isNotEmpty()
+                if(live || System.nanoTime()-node.lastPollAt>=IDLE_POLL_NANOS)poll(node,client)
+            },0,LIVE_POLL_MS,TimeUnit.MILLISECONDS)
+        }
+        RelayRepository.retainNodes(wanted.map{"node-"+it}.toSet())
+        (nodes.keys-wanted).forEach{id->workers.remove(id)?.shutdownNow();nodes.remove(id)}
+        runCatching{orchestrator.reconcileUnresolvedCellular()}.onFailure{
+            Log.w("GsmRtc","event=unknown_call_reconcile_failed error=${it.javaClass.simpleName}")
+        }
+    }
+    private fun poll(node:Node,client:ControlApiClient){
+        if(closed.get())return
+        node.lastPollAt=System.nanoTime()
+        try{
+            val now=System.nanoTime()
+            if(node.cheapControl&&!client.controlSocketAdvertised())node.capabilityAt=0L
+            if(now-node.capabilityAt>(if(node.cheapControl)3_600_000_000_000L else 25_000_000_000L)){
+                val capabilities=client.capabilityFlags()
+                node.supported=capabilities.optBoolean("rtc_call_control",false)
+                node.receptionV2=capabilities.optBoolean("reception_v2",false)
+                node.globalDecline=capabilities.optBoolean("global_decline_v1",false)
+                node.ringUntilEnd=capabilities.optBoolean("incoming_ring_until_end",false)
+                node.checked=true;node.capabilityAt=now
+                if(capabilities.optBoolean("ice_servers_v1"))RelayRepository.observeNode(context,"node-"+node.gatewayId,"节点 "+node.gatewayId.take(8))
+                node.cheapControl=capabilities.optJSONArray("extensions")?.let{list->(0 until list.length()).any{list.optString(it)=="rtc_control_ws_v1"}}==true
+                if(!node.supported){node.ready=false;return}
+                check(RtcAudioSession.isAvailable(context)){"RTC_NATIVE_UNAVAILABLE"}
+            }
+            if(node.supported && now-node.renewalAt>(if(node.cheapControl)3_600_000_000_000L else 25_000_000_000L)){
+                node.control.capability(true,node.globalDecline)
+                node.api.request("POST","/devices/self/rtc-capability",JSONObject().put("version",1))
+                node.renewalAt=now
+            }
+            if(!node.supported)return
+            GatewayDatabase.get(context).rtcTerminals(node.gatewayId).forEach{(id,kind)->
+                try {
+                    val snapshot=node.control.get(id)
+                    // A node that does not know a decline for every host is told the call ended.
+                    if(snapshot.getString("state")!="ended")node.control.operation(id,if(kind=="declined"&&!node.globalDecline)"ended" else kind)
+                    GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
+                }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
+            }
+            val calls=node.control.calls();node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
+            node.liveCalls=calls.any{it.optString("state") in SETTING_UP}
+            if(!wasReady)orchestrator.onRtcNodeReady()
+            calls.forEach{orchestrator.onRtcControlSnapshot(node,it)}
+        }catch(_:Throwable){
+            node.ready=false
+            if(System.nanoTime()-node.lastSeen>15_000_000_000L)orchestrator.onRtcControlLost(node)
+        }
+    }
+    /** Offers the ringing cellular call to every ready node. A definite create
+     * failure is left out; an ambiguous response still counts as a possible offer.
+     * Once offered, errors end this call; it is never offered a second time.
+     * Nodes that take it are told what is left of the ring window, which runs
+     * from ringStartedAt (elapsedRealtime); none is offered after it ends.
+     * Returns the longest window a node took: how long hosts may still answer. */
+    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,ringStartedAt:Long,valid:()->Boolean):Long{
+        val eligible=nodes.values.filter{it.supported && it.ready}
+        check(eligible.isNotEmpty()){"RTC_NO_READY_NODE"}
+        check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
+        val fork=IncomingForkCoordinator(eligible.map{it.gatewayId})
+        check(incomingOffers.putIfAbsent(id,fork)==null){"RTC_INCOMING_ALREADY_OFFERED"}
+        var offered=0
+        var ringWindow=INCOMING_RING_MS
+        try {
+            for(node in eligible){
+                check(valid()){"RTC_INCOMING_RETIRED"}
+                val window=if(node.ringUntilEnd && node.receptionV2)RING_UNTIL_END_MS else INCOMING_RING_MS
+                val remaining=remainingRingMs(ringStartedAt,SystemClock.elapsedRealtime(),window)
+                // An older node's short window may be over while a newer
+                // node still takes the call.
+                if(remaining<=0)continue
+                if(!fork.beginCreate(node.gatewayId))break
+                var requestAttempted=false
+                var snapshot:JSONObject?=null
+                var failure:Throwable?=null
+                try{
+                    val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
+                        .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
+                    checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
+                    IncomingOfferDiagnostics.started(id,node.gatewayId,remaining)
+                    requestAttempted=true
+                    snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
+                        "",true,number.takeIf{it.isNotBlank()},remaining.takeIf{node.receptionV2})
+                }catch(error:Throwable){failure=error}
+
+                val outcome=when{
+                    snapshot!=null->IncomingForkCoordinator.CreateOutcome.CREATED
+                    !requestAttempted->IncomingForkCoordinator.CreateOutcome.REJECTED
+                    failure?.let(::mayHaveCommittedCreate)==true->IncomingForkCoordinator.CreateOutcome.UNKNOWN
+                    else->IncomingForkCoordinator.CreateOutcome.REJECTED
+                }
+                val deliveries=fork.completeCreate(node.gatewayId,outcome)
+                deliveries.forEach{GatewayDatabase.get(context).queueRtcTerminal(id,it.nodeGatewayId,it.kind)}
+
+                if(outcome!=IncomingForkCoordinator.CreateOutcome.REJECTED)ringWindow=maxOf(ringWindow,window)
+                if(snapshot!=null){
+                    offered++
+                    try{orchestrator.onRtcControlSnapshot(node,snapshot!!)}catch(error:Exception){
+                        Log.w("GsmRtc","call_id=$id event=incoming_snapshot_failed node=${node.gatewayId.take(8)} error=${error.javaClass.simpleName}")
+                    }
+                }else{
+                    IncomingOfferDiagnostics.failed(id,node.gatewayId,remaining,failure)
+                }
+            }
+            check(offered>0){"RTC_INCOMING_NOT_OFFERED"}
+            Log.i("GsmRtc","call_id=$id event=incoming_offered nodes=$offered ring_window_ms=$ringWindow")
+            return ringWindow
+        }finally{
+            fork.finishOffers()
+            incomingOffers.remove(id,fork)
+        }
+    }
+    fun winner(id:String,winningNode:String){
+        val deliveries=incomingOffers[id]?.winner(winningNode)
+            ?:nodes.values.filter{it.supported && it.gatewayId!=winningNode}.map{IncomingForkCoordinator.TerminalDelivery(it.gatewayId,"answered_elsewhere")}
+        deliveries.forEach{GatewayDatabase.get(context).queueRtcTerminal(id,it.nodeGatewayId,it.kind)}
+    }
+    fun ended(id:String,state:String){
+        val fork=incomingOffers[id]
+        val terminalNodes=fork?.ended()?.map{it.nodeGatewayId}
+            ?:nodes.values.filter{it.supported}.map{it.gatewayId}
+        GatewayDatabase.get(context).completeRtcCellular(id,state,terminalNodes)
+    }
+
+    override fun close(){
+        if(!closed.compareAndSet(false,true))return
+        reconciler.shutdownNow();workers.values.forEach{it.shutdownNow()};workers.clear();nodes.clear()
+    }
+}

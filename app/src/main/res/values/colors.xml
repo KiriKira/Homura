@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material 3 role fallbacks for devices that do not provide wallpaper colors. -->
+    <color name="m3_primary">#3659A2</color>
+    <color name="m3_on_primary">#FFFFFF</color>
+    <color name="m3_primary_container">#D9E2FF</color>
+    <color name="m3_on_primary_container">#001A41</color>
+    <color name="m3_secondary">#575E71</color>
+    <color name="m3_on_secondary">#FFFFFF</color>
+    <color name="m3_secondary_container">#DBE2F9</color>
+    <color name="m3_on_secondary_container">#141B2C</color>
+    <color name="m3_tertiary">#725475</color>
+    <color name="m3_on_tertiary">#FFFFFF</color>
+    <color name="m3_tertiary_container">#FBD7FA</color>
+    <color name="m3_on_tertiary_container">#2B1230</color>
+    <color name="m3_error">#BA1A1A</color>
+    <color name="m3_on_error">#FFFFFF</color>
+    <color name="m3_error_container">#FFDAD6</color>
+    <color name="m3_on_error_container">#410002</color>
+    <color name="m3_surface">#FAF8FF</color>
+    <color name="m3_on_surface">#1A1B20</color>
+    <color name="m3_surface_variant">#E2E2EB</color>
+    <color name="m3_on_surface_variant">#44464F</color>
+    <color name="m3_outline">#747780</color>
+    <color name="m3_outline_variant">#C4C6D0</color>
+    <color name="m3_surface_container_lowest">#FFFFFF</color>
+    <color name="m3_surface_container_low">#F4F3FA</color>
+    <color name="m3_surface_container">#EEEFF6</color>
+    <color name="m3_surface_container_high">#E8E9F0</color>
+    <color name="m3_surface_container_highest">#E2E3EA</color>
+    <!-- Matches the dark field around the launcher artwork. -->
+    <color name="ic_launcher_background">#2B2B36</color>
+</resources>

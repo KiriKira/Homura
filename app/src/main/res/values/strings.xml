@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Homura</string>
+    <string name="activity_title">Homura</string>
+    <string name="channel_name">Homura 后台网关</string>
+    <string name="channel_description">显示用户启用的网关连接状态</string>
+    <string name="channel_name_quiet">Homura 后台服务（静默）</string>
+    <string name="channel_description_quiet">后台运行时不显示状态栏图标</string>
+    <string name="notification_title">Homura</string>
+</resources>

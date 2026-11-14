@@ -1,0 +1,816 @@
+package com.callagent.gateway.gsm
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioManager
+import android.os.Build
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.telecom.Call
+import android.telecom.DisconnectCause
+import android.telecom.CallAudioState
+import android.telecom.InCallService
+import android.telecom.TelecomManager
+import android.telephony.TelephonyManager
+import android.util.Log
+import com.callagent.gateway.DeviceProfile
+import com.callagent.gateway.RootShell
+import com.callagent.gateway.sim.SimRegistry
+import java.util.Collections
+import java.util.IdentityHashMap
+
+/**
+ * GSM call manager: answers/makes/hangs up GSM calls, tracks state.
+ *
+ * Calls are controlled through the InCallService (GsmCallService).
+ * Audio defaults to stream-scoped Telephony Rx/Tx routing. Legacy mixer
+ * presets require explicit local configuration through the Magisk module.
+ *
+ * Host→GSM: AudioTrack (USAGE_MEDIA / deep-buffer) → incall_music →
+ * HAL injects STREAM_MUSIC digitally into voice TX (uplink).
+ *
+ * GSM→host: VOICE_CALL capture provides digital uplink+downlink audio.
+ *
+ * ALL tinymix commands are batched into a single su call to minimise
+ * JVM spawning on low-end devices.
+ */
+object GsmCallManager {
+
+    private const val TAG = "GsmCallManager"
+
+
+    /** Active device profile — initialized on first use. */
+    val profile: DeviceProfile by lazy { DeviceProfile.detect() }
+
+    // Current active GSM call
+    @Volatile var activeCall: Call? = null; private set
+    @Volatile var activeCallState: Int = Call.STATE_NEW; private set
+    private val callLock = Any()
+    private val incomingCallsSeen = Collections.newSetFromMap(IdentityHashMap<Call, Boolean>())
+
+    /**
+     * Why the last GSM call ended.
+     *
+     * Read at STATE_DISCONNECTED and kept, because the bridge tears down
+     * afterwards and the Call object may be invalidated by then — and the
+     * cause is what decides the end reason the server is told.
+     */
+    @Volatile var lastDisconnectCause: DisconnectCause? = null
+        private set
+    @Volatile var inCallService: InCallService? = null; private set
+
+    private data class GenericAudioState(
+        val call: Call?,
+        val service: InCallService,
+        val route: Int?,
+        val microphoneMuted: Boolean?,
+        val voiceCallVolume: Int? = null,
+        val telecomMuted: Boolean? = null
+    )
+
+    /**
+     * Silence this phone's own microphone and earpiece while a call is
+     * bridged (digital routing only). The caller's voice otherwise plays from
+     * the earpiece, the live microphone picks it up, and the caller hears it
+     * back as echo. The host's voice reaches the uplink through the telephony
+     * TX injection, which a call mute does not touch on platforms that support
+     * that injection; the setting exists for a device where it does.
+     */
+    @Volatile var silenceHandsetDuringCalls: Boolean = true
+    private var genericAudioState: GenericAudioState? = null
+
+    @Volatile var listener: Listener? = null
+
+    /** Optional callback for routing important audio diagnostics to the
+     *  app log viewer (Settings tab).  Set by GatewayService. */
+    @Volatile var logCallback: ((String) -> Unit)? = null
+
+    private fun stateName(state: Int) = when (state) {
+        Call.STATE_NEW -> "NEW"
+        Call.STATE_DIALING -> "DIALING"
+        Call.STATE_RINGING -> "RINGING"
+        Call.STATE_HOLDING -> "HOLDING"
+        Call.STATE_ACTIVE -> "ACTIVE"
+        Call.STATE_DISCONNECTED -> "DISCONNECTED"
+        Call.STATE_CONNECTING -> "CONNECTING"
+        Call.STATE_DISCONNECTING -> "DISCONNECTING"
+        Call.STATE_SELECT_PHONE_ACCOUNT -> "SELECT_PHONE_ACCOUNT"
+        Call.STATE_PULLING_CALL -> "PULLING_CALL"
+        else -> "OTHER($state)"
+    }
+
+    /** Log to both Android logcat AND the app log viewer. */
+    private fun appLog(msg: String) {
+        Log.i(TAG, msg)
+        logCallback?.invoke(msg)
+    }
+
+    interface Listener {
+        /** Incoming GSM call ringing — caller number provided */
+        fun onIncomingGsmCall(call: Call, number: String)
+        /** GSM call connected (active) */
+        fun onGsmCallActive(call: Call)
+        /** GSM call state changed */
+        fun onGsmCallStateChanged(call: Call, state: Int)
+        /** GSM call ended */
+        fun onGsmCallEnded(call: Call)
+    }
+
+    // ── InCallService callbacks ─────────────────────────
+
+    fun onCallAdded(call: Call, service: InCallService) {
+        inCallService = service
+        val isPrimary = synchronized(callLock) {
+            val current = activeCall
+            if (current == null || activeCallState == Call.STATE_DISCONNECTED) {
+                activeCall = call
+                activeCallState = call.state
+                lastDisconnectCause = null
+                // Release the previous call's object; the dedupe only needs to
+                // span one primary call's own disconnect.
+                endedCall = null
+                incomingCallsSeen.remove(call)
+                true
+            } else current === call
+        }
+
+        val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+
+        if (!isPrimary) {
+            // In the app log: a second call during a dial is exactly what a
+            // "busy" outgoing call needs ruled in or out.
+            appLog("GSM: additional Telecom call observed while primary call is active (state=${stateName(call.state)})")
+            if (call.state == Call.STATE_RINGING) notifyIncomingCallOnce(call, number)
+            return
+        }
+
+        when (call.state) {
+            Call.STATE_RINGING -> {
+                Log.i(TAG, "Incoming GSM call detected")
+                // Silence the ringtone immediately — this is a gateway device,
+                // not a user-facing phone.  The call will be auto-answered
+                // once the host's media is connected.
+                try {
+                    val am = service.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Ringer silence failed: ${e.message}")
+                }
+                notifyIncomingCallOnce(call, number)
+            }
+            Call.STATE_DIALING, Call.STATE_CONNECTING -> {
+                appLog("GSM: outgoing call added (state=${stateName(call.state)})")
+            }
+            Call.STATE_ACTIVE -> {
+                Log.i(TAG, "GSM call active")
+                configureAudioBridge()
+                listener?.onGsmCallActive(call)
+            }
+        }
+    }
+
+    /** The call already reported as ended, so it is reported exactly once.
+     *
+     *  A disconnect arrives twice: once as a STATE_DISCONNECTED callback and
+     *  again as onCallRemoved.  Both used to fire onGsmCallEnded, so the
+     *  orchestrator tore the bridge down twice for one call — harmless only
+     *  because tearDown happens to be state-guarded, which is not a property
+     *  worth depending on. */
+    @Volatile private var endedCall: Call? = null
+
+
+
+    private fun notifyCallEnded(call: Call) {
+        if (endedCall === call) return
+        endedCall = call
+        listener?.onGsmCallEnded(call)
+    }
+
+    private fun notifyIncomingCallOnce(call: Call, number: String) {
+        val first = synchronized(callLock) { incomingCallsSeen.add(call) }
+        if (first) listener?.onIncomingGsmCall(call, number)
+    }
+
+    /**
+     * Telecom has unbound the InCallService.
+     *
+     * [inCallService] is a static reference to a Service — a full Context —
+     * and nothing ever cleared it, so every unbind/rebind cycle (dialer role
+     * change, service restart) left the previous instance pinned for the life
+     * of the process.
+     */
+    fun onServiceUnbound(service: InCallService) {
+        if (inCallService === service) {
+            inCallService = null
+            Log.i(TAG, "InCallService unbound")
+        }
+    }
+
+    fun onCallRemoved(call: Call) {
+        Log.i(TAG, "GSM call removed")
+        val wasPrimary = synchronized(callLock) {
+            incomingCallsSeen.remove(call)
+            val primary = activeCall === call || endedCall === call
+            if (activeCall === call) {
+                activeCall = null
+                activeCallState = Call.STATE_DISCONNECTED
+            }
+            primary
+        }
+        if (wasPrimary) {
+            restoreAudio()
+            notifyCallEnded(call)
+        }
+    }
+
+    fun onCallStateChanged(call: Call, state: Int) {
+        val isPrimary = synchronized(callLock) {
+            if (activeCall === call) activeCallState = state
+            activeCall === call
+        }
+
+        if (state != Call.STATE_DISCONNECTED) appLog("GSM: state ${stateName(state)} (primary=$isPrimary)")
+        when (state) {
+            Call.STATE_RINGING -> {
+                // Handle calls that arrive as STATE_NEW in onCallAdded and
+                // transition to RINGING via the callback.  Without this,
+                // the orchestrator never learns about the incoming call.
+                val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
+                Log.i(TAG, "GSM call ringing (via state change)")
+                notifyIncomingCallOnce(call, number)
+            }
+            Call.STATE_ACTIVE -> {
+                if (!isPrimary) {
+                    Log.w(TAG, "Non-primary Telecom call became active; it will not replace the bridged call")
+                    return
+                }
+                Log.i(TAG, "GSM call active")
+                configureAudioBridge()
+                listener?.onGsmCallActive(call)
+            }
+            Call.STATE_DISCONNECTED -> {
+                if (isPrimary) {
+                    lastDisconnectCause = try {
+                        call.details?.disconnectCause
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Disconnect cause unavailable: ${e.message}")
+                        null
+                    }
+                }
+                val cause = if (isPrimary) lastDisconnectCause else runCatching { call.details?.disconnectCause }.getOrNull()
+                appLog("GSM: call disconnected (primary=$isPrimary, cause=${cause?.code}, reason=${cause?.reason}, label=${cause?.label})")
+                if (isPrimary) {
+                    notifyCallEnded(call)
+                    synchronized(callLock) {
+                        if (activeCall === call) activeCall = null
+                    }
+                }
+            }
+        }
+        if (isPrimary) listener?.onGsmCallStateChanged(call, state)
+    }
+
+    // ── Call control ────────────────────────────────────
+
+    /** Answer a ringing GSM call */
+    fun answerCall(call: Call? = activeCall) {
+        call?.let {
+            Log.i(TAG, "Answering GSM call")
+            it.answer(it.details.videoState)
+        }
+    }
+
+    /** Reject a ringing GSM call */
+    fun rejectCall(call: Call? = activeCall) {
+        call?.let {
+            Log.i(TAG, "Rejecting GSM call")
+            it.reject(false, "")
+        }
+    }
+
+    /** Hang up active GSM call */
+    fun hangupCall(call: Call? = activeCall) {
+        call?.let {
+            Log.i(TAG, "Hanging up GSM call")
+            it.disconnect()
+        }
+    }
+
+    /** Place outgoing GSM call via the SIM */
+    /**
+     * Place an outgoing GSM call.
+     *
+     * Uses TelecomManager.placeCall rather than startActivity(ACTION_CALL).
+     * The gateway dials from a foreground service with no visible Activity,
+     * and Android 15+ blocks background activity launches, so the intent form
+     * never reaches Telecom at all — it is dropped with BAL_BLOCK and the call
+     * simply never happens.  placeCall is a binder call into Telecom, needs no
+     * Activity, and we hold CALL_PHONE (plus CALL_PRIVILEGED as a priv-app);
+     * as the default dialer, Telecom hands the call back to our InCallService.
+     * This path always supplies the verified PhoneAccountHandle selected by
+     * the SIM registry; it never falls back to the user's default account.
+     */
+    /**
+     * True for dial strings that are MMI/USSD codes rather than phone numbers
+     * — anything containing '*' or '#', e.g. *132# (balance) or *#06# (IMEI).
+     *
+     * These must never reach placeCall: Telecom rejects them with
+     * "Connection is null, DIALED_MMI", and on this build that took
+     * TelephonyConnectionService down with it.
+     */
+    fun isMmiCode(dialString: String): Boolean {
+        val s = dialString.trim()
+        return s.isNotEmpty() && (s.contains('*') || s.contains('#'))
+    }
+
+    /**
+     * Run an MMI/USSD code and report the network's answer via [onResult].
+     *
+     * USSD codes (those ending in '#') go through sendUssdRequest, which hands
+     * the reply back to us so it can be logged — useful on a headless gateway
+     * where nobody is watching for a system dialog.  Anything else (IMEI
+     * lookups, call-forwarding shortcuts) goes to Telecom's own MMI handling.
+     */
+    @SuppressLint("MissingPermission")
+    fun sendMmi(context: Context, dialString: String, onResult: (String) -> Unit) {
+        val code = dialString.trim()
+        if (code.endsWith("#")) {
+            try {
+                val telephony =
+                    context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                telephony.sendUssdRequest(
+                    code,
+                    object : TelephonyManager.UssdResponseCallback() {
+                        override fun onReceiveUssdResponse(
+                            tm: TelephonyManager, request: String, response: CharSequence
+                        ) {
+                            Log.i(TAG, "USSD response received")
+                            onResult(response.toString())
+                        }
+
+                        override fun onReceiveUssdResponseFailed(
+                            tm: TelephonyManager, request: String, failureCode: Int
+                        ) {
+                            Log.w(TAG, "USSD request failed")
+                            onResult("USSD request failed (code $failureCode)")
+                        }
+                    },
+                    Handler(Looper.getMainLooper())
+                )
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "sendUssdRequest failed — falling back to Telecom")
+            }
+        }
+        try {
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            val handled = telecom.handleMmi(code)
+            onResult(if (handled) "MMI $code sent" else "MMI $code not recognised")
+        } catch (e: Exception) {
+            onResult("MMI request failed")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun makeCall(
+        context: Context,
+        destination: String,
+        simId: String,
+        mappingRevision: Long,
+        localRevisionBarrier: Long
+    ): Boolean {
+        val dialString = destination.trim()
+        if (dialString.isEmpty() || isMmiCode(dialString)) {
+            Log.w(TAG, "Rejecting empty/MMI destination from SIM call dispatcher")
+            return false
+        }
+        if (profile.configError != null) {
+            appLog("Call refused: invalid local Magisk audio configuration")
+            return false
+        }
+        val mapping = try {
+            SimRegistry.resolveForVoice(context, simId, mappingRevision, localRevisionBarrier)
+        } catch (e: SimRegistry.SimMappingException) {
+            Log.w(TAG, "SIM-directed call refused (${e.code})")
+            return false
+        }
+        return dispatchPreparedCall(context, dialString, mapping) { dispatch -> dispatch() }
+    }
+
+    /** Resolve local profile/config state before the short, guarded Telecom dispatch. */
+    fun prepareVoiceCallDispatch(): Boolean = try {
+        profile.configError == null
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not prepare local audio configuration: ${e.javaClass.simpleName}")
+        false
+    }
+
+    /**
+     * Place a call with a mapping that was already resolved and revalidated on
+     * a worker. [guardedDispatch] must run [dispatch] atomically with the
+     * caller's call-cancellation/teardown checks. This method performs no SIM
+     * lookup or profile/root I/O.
+     */
+    @SuppressLint("MissingPermission")
+    fun dispatchPreparedCall(
+        context: Context,
+        destination: String,
+        mapping: SimRegistry.SimMapping,
+        guardedDispatch: ((() -> Boolean) -> Boolean)
+    ): Boolean {
+        val dialString = destination.trim()
+        if (dialString.isEmpty() || isMmiCode(dialString)) {
+            Log.w(TAG, "Rejecting empty/MMI destination from SIM call dispatcher")
+            return false
+        }
+        val handle = mapping.phoneAccountHandle
+        if (!mapping.voiceAvailable || handle == null) return false
+
+        val telecom = try {
+            context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        } catch (e: Exception) {
+            Log.e(TAG, "Telecom unavailable for SIM-directed call: ${e.javaClass.simpleName}")
+            return false
+        }
+        val extras = Bundle().apply {
+            putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+        }
+        val placeCall = {
+            try {
+                telecom.placeCall(Uri.fromParts("tel", dialString, null), extras)
+                Log.i(TAG, "Telecom call dispatched with explicit SIM account")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Explicit SIM Telecom placeCall failed: ${e.javaClass.simpleName}")
+                false
+            }
+        }
+        return guardedDispatch(placeCall)
+    }
+
+    /** Music volume percent — from device profile. */
+    /**
+     * Manual trim on the agent's level into the GSM uplink, -3..+3, 0 being
+     * the device profile's own value.
+     *
+     * It multiplies [DeviceProfile.playbackGain] rather than the music stream
+     * volume, because the stream is not where the loudness lives: it clips
+     * above about 14% on the devices that inject through incall_music, so
+     * raising it buys distortion rather than level.  The digital gain applied
+     * before the AudioTrack write is the one that carries.
+     *
+     * Steps are geometric so a step means the same thing on a profile that
+     * starts at gain 1 and one that starts at 2.
+     */
+    @Volatile var agentVolumeStep: Int = 0
+
+    private val AGENT_GAIN_FACTORS =
+        doubleArrayOf(0.40, 0.55, 0.75, 1.0, 1.4, 2.0, 2.8)
+
+    /** Multiplier the step asks for, 1.0 at step 0. */
+    val agentGainFactor: Double
+        get() = AGENT_GAIN_FACTORS[agentVolumeStep.coerceIn(-3, 3) + 3]
+
+    val MUSIC_VOL_PERCENT: Int get() = profile.musicVolPercent
+
+    /** Run mixer discovery once on first audio bridge setup. */
+    @Volatile private var discoveryDone = false
+
+    private fun runMixerDiscovery() {
+        if (discoveryDone) return
+        discoveryDone = true
+        Thread({
+            try {
+                val discovery = DeviceProfile.discoverMixerControls(profile)
+                for (line in discovery.lines()) {
+                    if (line.isNotBlank()) Log.i(TAG, "MixerDiscovery: $line")
+                }
+                // Send summary to app log viewer (not the full dump)
+                val cards = discovery.lines()
+                    .filter { it.contains("[") && it.contains("]") && it.contains(":") }
+                    .joinToString(", ") { it.trim() }
+                val tinymix = if (DeviceProfile.tinymixBin.isNotEmpty())
+                    DeviceProfile.tinymixBin else "NOT FOUND"
+                appLog("ALSA: tinymix=$tinymix cards=[$cards]")
+            } catch (e: Exception) {
+                appLog("Mixer discovery failed: ${e.message}")
+            }
+        }, "MixerDiscovery").start()
+    }
+
+    /** Configure audio for the GSM↔host bridge using the active device profile. */
+    private fun configureAudioBridge() {
+        if (profile.configError != null) {
+            appLog("Audio unavailable: invalid local Magisk audio configuration")
+            return
+        }
+        if (profile.useGenericRouting) {
+            // The generic route belongs to each AudioRecord/AudioTrack and
+            // is released with that stream. Never alter the user's speaker,
+            // microphone mute, stream volumes or vendor mixer defaults.
+            appLog("Audio: Magisk generic digital routing; capabilities are verified by the media session")
+            if (profile.allowMicFallback && profile.requireSpeakerMode) {
+                // Acoustic capture is an explicit local option. Keep the
+                // original state; never restore guessed volume/mute defaults.
+                inCallService?.let { service ->
+                    val am = service.getSystemService(AudioManager::class.java)
+                    if (genericAudioState?.call !== activeCall || genericAudioState == null) {
+                        genericAudioState = GenericAudioState(
+                            activeCall, service,
+                            runCatching { service.callAudioState?.route }.getOrNull(),
+                            runCatching { am?.isMicrophoneMute }.getOrNull()
+                        )
+                    }
+                    runCatching { service.setAudioRoute(CallAudioState.ROUTE_SPEAKER) }
+                    runCatching { am?.isMicrophoneMute = false }
+                    appLog("Audio: locally enabled microphone fallback requested; no volume changes")
+                }
+            } else if (silenceHandsetDuringCalls) {
+                silenceHandset()
+            }
+            return
+        }
+        try {
+            // Run ALSA mixer discovery on first call for diagnostics
+            runMixerDiscovery()
+
+            inCallService?.let { service ->
+                val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+
+                // Samsung HAL params (incall_music_enabled, g_call_path, etc.)
+                // are NOT set here — they fire in CellularAudioSession.enableIncallMusic()
+                // AFTER the AudioRecord is running.  Setting them before capture
+                // kills VOICE_CALL capture (confirmed v2.8.33).
+
+                if (profile.requireSpeakerMode) {
+                    service.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
+                }
+
+                if (profile.silenceLocalAudio) {
+                    // Mute through Telecom as well as AudioManager.  Telecom
+                    // owns the call's mute state and re-applies it whenever the
+                    // audio route changes, so an AudioManager-only mute can be
+                    // quietly undone underneath us.
+                    try {
+                        service.setMuted(true)
+                        appLog("Telecom mute requested")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Telecom setMuted failed: ${e.message}")
+                    }
+                }
+
+                audioManager?.let { am ->
+                    // Do NOT set isMicrophoneMute = true here!
+                    // v2.8.50: Samsung Exynos HAL interprets mic mute as "mute
+                    // entire voice uplink to modem", which blocks NSRC-injected
+                    // AudioTrack audio from reaching the caller.
+                    // MSM8930: mic muting is handled at ALSA level (DEC MUX=ZERO,
+                    // MICBIAS=0) in mixerSetupCmd — no need for API-level mute.
+                    // Profiles that silence the handset re-mute in
+                    // enforceVolumes() immediately below.
+                    if (!profile.silenceLocalAudio) {
+                        am.isMicrophoneMute = false
+                    }
+                    enforceVolumes(am)
+
+                    // Delay mixer/volume setup until speaker route change settles.
+                    Thread({
+                        try {
+                            Thread.sleep(profile.routeChangeDelayMs)
+                            enforceVolumes(am)
+                            batchMixerSetup()
+                        } catch (_: Exception) {}
+                    }, "VolEnforce").start()
+
+                    // Samsung Exynos re-route dance REMOVED (v2.8.39):
+                    // v2.8.38 tried earpiece→speaker re-route at t=3s to force HAL
+                    // voice path recreation with incall_music ausage.  Results:
+                    //   - Audio moved from speaker to earpiece and STAYED there
+                    //   - 300ms delay was insufficient for route to settle
+                    //   - No incall_music mixer controls exist on Exynos 9820 anyway
+                    //     (confirmed: 1267 tinymix controls, zero match incall/inject)
+                    //   - No ausage config files on this firmware
+                    // The re-route served no purpose and broke speaker mode.
+
+                    val tinymixStatus = if (DeviceProfile.tinymixBin.isNotEmpty()) "available" else "NOT FOUND"
+                    val route = if (profile.requireSpeakerMode) "speaker" else "earpiece"
+                    appLog("Audio bridge: $route, mode=${am.mode}, tinymix=$tinymixStatus, profile=${profile.name}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to configure audio: ${e.message}")
+        }
+    }
+
+    /** Mute the handset microphone and turn the earpiece down for this call; restored in [restoreAudio]. */
+    private fun silenceHandset() {
+        val service = inCallService ?: return
+        val am = service.getSystemService(AudioManager::class.java) ?: return
+        if (genericAudioState?.call !== activeCall || genericAudioState == null) {
+            genericAudioState = GenericAudioState(
+                activeCall, service,
+                route = null,
+                microphoneMuted = null,
+                voiceCallVolume = runCatching { am.getStreamVolume(AudioManager.STREAM_VOICE_CALL) }.getOrNull(),
+                telecomMuted = runCatching { service.callAudioState?.isMuted }.getOrNull()
+            )
+        }
+        // Through Telecom, which owns the call's mute and re-applies it on
+        // every route change; an AudioManager-only mute can be undone under us.
+        val muted = runCatching { service.setMuted(true) }.isSuccess
+        val lowest = runCatching {
+            val min = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                am.getStreamMinVolume(AudioManager.STREAM_VOICE_CALL)
+            } else 1
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, min.coerceAtLeast(1), 0)
+            am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        }.getOrNull()
+        appLog("Audio: handset silenced against echo (mic ${if (muted) "muted" else "mute refused"}, " +
+            "earpiece volume ${lowest ?: "unchanged"}). If the caller cannot hear you, turn off " +
+            "\"通话时静音本机\" in settings.")
+    }
+
+    /** Set audio stream volumes for the GSM↔host bridge.
+     *  Called multiple times: immediately, after delayed route change,
+     *  and from CellularAudioSession as a secondary safeguard. */
+    fun enforceVolumes(am: AudioManager) {
+        if (profile.useGenericRouting || profile.configError != null) return
+        // Clear any stale ADJUST_MUTE flag from a previous call.
+        // CRITICAL: Do NOT use ADJUST_MUTE on STREAM_VOICE_CALL — on
+        // MSM8930 it kills the incall_music injection path, preventing
+        // the agent's audio from reaching the GSM caller.  Speaker
+        // silencing is handled by muteVoiceRx() at the ALSA mixer level.
+        try {
+            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+        } catch (_: SecurityException) {}
+
+        if (profile.silenceLocalAudio) {
+            // Digital bridge: silence the handset itself.  Done through
+            // AudioManager because it goes via the HAL, unlike the ALSA voice
+            // mutes which the HAL overwrites when it programs the call path.
+            try {
+                am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0)
+            } catch (_: SecurityException) {}
+            try {
+                am.isMicrophoneMute = true
+            } catch (e: Exception) {
+                Log.w(TAG, "Mic mute failed: ${e.message}")
+            }
+            appLog("Local audio silenced: speaker muted, mic muted (digital only)")
+            return
+        }
+
+        // Voice call volume: controls caller's voice on speaker.
+        // MSM8930: minimum (1) — speaker silenced by muteVoiceRx via tinymix.
+        // Exynos 9820: 80% — no muteVoiceRx, need loud speaker for mic capture.
+        // Volume=0 can confuse audio policy into treating call as inactive.
+        try {
+            val vcVol = if (profile.voiceCallVolPercent > 0) {
+                val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                (maxVc * profile.voiceCallVolPercent / 100).coerceAtLeast(1)
+            } else {
+                1
+            }
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, vcVol, 0)
+        } catch (_: SecurityException) {}
+        // Music stream controls incall_music injection level into
+        // the modem uplink.  Lower value = quieter speaker + quieter
+        // agent voice for the GSM caller.
+        val maxMusic = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val musicVol = (maxMusic * MUSIC_VOL_PERCENT / 100).coerceAtLeast(1)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, musicVol, 0)
+        // Read back actual values to confirm they stuck
+        val actualVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        val actualMusic = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val muted = am.isStreamMute(AudioManager.STREAM_VOICE_CALL)
+        appLog("Vol: voice=$actualVoice(m=$muted), music=$actualMusic/$maxMusic(target=$musicVol)")
+    }
+
+    /** Restore audio state when call ends */
+    private fun restoreAudio() {
+        // Digital routing has no global changes; explicitly enabled acoustic
+        // routing restores only the state saved for this same call.
+        if (profile.useGenericRouting || profile.configError != null) {
+            val saved = genericAudioState
+            genericAudioState = null
+            if (saved != null && (activeCall == null || activeCall === saved.call)) {
+                val am = saved.service.getSystemService(AudioManager::class.java)
+                saved.microphoneMuted?.let { muted -> runCatching { am?.isMicrophoneMute = muted } }
+                saved.telecomMuted?.let { muted -> runCatching { saved.service.setMuted(muted) } }
+                saved.voiceCallVolume?.let { volume ->
+                    runCatching { am?.setStreamVolume(AudioManager.STREAM_VOICE_CALL, volume, 0) }
+                }
+                if (inCallService === saved.service) saved.route?.let { route ->
+                    if (route > 0 && Integer.bitCount(route) == 1) {
+                        runCatching { saved.service.setAudioRoute(route) }
+                    }
+                }
+            }
+            return
+        }
+        // The mixer restore is a root shell round trip, and this runs on the
+        // main thread: onCallRemoved is an InCallService callback.  Setup
+        // already does its su work on a thread of its own; teardown did not,
+        // so the end of every call blocked the main thread until the shell
+        // answered -- up to the full RootShell timeout when it was slow, and
+        // for the whole timeout when root had been denied.  That stalls the
+        // UI and the service's own callbacks together, since both live in
+        // this one process.
+        Thread({ batchMixerRestore() }, "MixerRestore").start()
+        try {
+            inCallService?.let { service ->
+                service.setAudioRoute(CallAudioState.ROUTE_EARPIECE)
+
+                val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                audioManager?.let { am ->
+                    am.isMicrophoneMute = false
+                    // Clear incall_music HAL parameter for clean state on next call
+                    if (profile.incallMusicParam.isNotEmpty()) {
+                        am.setParameters("${profile.incallMusicParam}=false")
+                    }
+
+                    // Unmute voice call stream and restore volume for normal phone use
+                    try {
+                        try { am.isMicrophoneMute = false } catch (_: Exception) {}
+                        am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0)
+                    } catch (_: SecurityException) {}
+                    try {
+                        val maxVc = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, (maxVc * 2 / 3).coerceAtLeast(1), 0)
+                    } catch (_: SecurityException) {}
+                    Log.i(TAG, "Audio restored: earpiece, VoiceRx unmuted, echoRef=SLIM_RX, incall_music=false")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore audio: ${e.message}")
+        }
+    }
+
+    /**
+     * Set up mixer controls for audio bridge using the device profile.
+     * All commands batched into a single su call for efficiency.
+     *
+     * Commands reference bare 'tinymix' — [DeviceProfile.resolveCmd] replaces
+     * it with the discovered full path at runtime.
+     */
+    fun batchMixerSetup() {
+        if (profile.mixerSetupCmd.isEmpty()) {
+            appLog("Mixer: no commands for ${profile.name}")
+            return
+        }
+        val resolvedSetup = DeviceProfile.resolveCmd(profile.mixerSetupCmd)
+        if (resolvedSetup.isEmpty()) {
+            appLog("Mixer: tinymix NOT FOUND — cannot set controls for ${profile.name}")
+            return
+        }
+        try {
+            // Readback before/after so a setup that silently did nothing is
+            // visible in the call log.  Which controls matter is SoC-specific,
+            // so the profile supplies the command — the ABOX names this used
+            // to hardcode exist only on Samsung's DSP and answered "control
+            // not found" on every other device.
+            val verify = DeviceProfile.resolveCmd(profile.mixerVerifyCmd)
+            if (verify.isNotEmpty()) {
+                appLog("Mixer BEFORE: ${RootShell.execForOutput(verify, timeoutMs = 8000)}")
+            }
+
+            val setupOutput = RootShell.execForOutput(resolvedSetup, timeoutMs = 8000)
+            if (setupOutput.isNotBlank()) appLog("Mixer setup: $setupOutput")
+
+            if (verify.isNotEmpty()) {
+                appLog("Mixer AFTER: ${RootShell.execForOutput(verify, timeoutMs = 10000)}")
+            }
+        } catch (e: Exception) {
+            appLog("Mixer setup FAILED: ${e.message}")
+        }
+    }
+
+    /** Restore mixer state when call ends using the device profile. */
+    fun batchMixerRestore() {
+        if (profile.mixerRestoreCmd.isEmpty()) {
+            Log.i(TAG, "batchMixerRestore: no mixer commands for ${profile.name}")
+            return
+        }
+        val resolvedRestore = DeviceProfile.resolveCmd(profile.mixerRestoreCmd)
+        if (resolvedRestore.isEmpty()) {
+            Log.i(TAG, "batchMixerRestore: tinymix not found, skipping")
+            return
+        }
+        try {
+            RootShell.exec(resolvedRestore)
+            appLog("Mixer restored")
+        } catch (e: Exception) {
+            appLog("Mixer restore FAILED: ${e.message}")
+        }
+    }
+
+    /** Check if a GSM call is currently active */
+    val isCallActive: Boolean
+        get() = activeCall != null && activeCallState == Call.STATE_ACTIVE
+
+    /** Get current call number */
+    val currentNumber: String?
+        get() = activeCall?.details?.handle?.schemeSpecificPart
+}
