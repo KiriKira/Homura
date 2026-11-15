@@ -25,8 +25,7 @@ internal class NativePeer(
     private val onFailure: (String) -> Unit,
     forceRelay: Boolean = false,
     private val relayOrigins: (String) -> Set<String> = { emptySet() },
-    private val multipleSources:Boolean=false,
-    private val onGatheringComplete:(Int)->Unit={}
+    private val multipleSources:Boolean=false
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
@@ -35,6 +34,9 @@ internal class NativePeer(
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
     // Count native callbacks before trickle filtering; diagnostics concern actual gathering.
     private val gatheredCandidateCount = java.util.concurrent.atomic.AtomicInteger()
+    /** Local candidates native gathering has produced so far. Gathering COMPLETE
+     * can precede late TURN candidates, so read this only when diagnosing a failure. */
+    val gatheredCandidates: Int get() = gatheredCandidateCount.get()
     val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
     fun takeCandidates(): LocalIceQueue.Batch<IceCandidate> = localCandidates.drain()
     private val lock = Any()
@@ -114,7 +116,6 @@ internal class NativePeer(
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
                 onEvent("gathering_${state.name.lowercase()}")
-                if(state==PeerConnection.IceGatheringState.COMPLETE && !closed.get())onGatheringComplete(gatheredCandidateCount.get())
             }
             override fun onIceCandidate(candidate: IceCandidate) {
                 gatheredCandidateCount.incrementAndGet()
