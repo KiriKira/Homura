@@ -57,6 +57,7 @@ class TestCallRunner(
     }
     @Volatile private var active: Active? = null
     val busy: Boolean get() = active != null
+    fun activeCall(node: String): String? = active?.takeIf{it.node.gatewayId==node}?.callId
 
     private fun event(call: Active, text: String) {
         val line = "media=webrtc call_control=rtc call_id=${call.callId} test_call=true event=$text elapsed_ms=${SystemClock.elapsedRealtime() - call.startedAt}"
@@ -76,6 +77,7 @@ class TestCallRunner(
             return
         }
         val call = Active(node, requestId, UUID.randomUUID().toString())
+        GatewayDatabase.get(context).rememberTestCall(call.callId,node.gatewayId)
         synchronized(this) { if (active != null) return; active = call }
         try { worker.execute { run(call) } } catch (_: Exception) { synchronized(this) { if (active === call) active = null } }
     }
@@ -103,7 +105,7 @@ class TestCallRunner(
     fun preempt(timeoutMs: Long): Boolean {
         val call = active ?: return true
         runCatching { ender.execute { finish(call, "preempted_by_cellular_call") } }
-        return call.done.await(timeoutMs, TimeUnit.MILLISECONDS)
+        return call.done.await(timeoutMs, TimeUnit.MILLISECONDS) && call.snapshot?.optString("state")=="ended"
     }
 
     private fun sims(node: GatewayCallControl.Node): List<Pair<String, Long>> =
@@ -144,8 +146,13 @@ class TestCallRunner(
         event(call, "test_call_accepted request=${call.requestId.take(8)} node=${call.node.gatewayId.take(8)} force_relay=${BuildConfig.FORCE_RTC_RELAY}")
         val audio: Future<TestCallAudio.Decoded> = audioLoader.submit<TestCallAudio.Decoded> { TestCallAudio.load(context) }
         try {
+            if (call.finished.get()) return
             val created = createCall(call) ?: return finish(call, "create_failed")
             call.snapshot = created
+            if (call.finished.get()) {
+                GatewayDatabase.get(context).queueRtcTerminal(call.callId,call.node.gatewayId)
+                return
+            }
             event(call, "test_call_ringing sim=${created.optString("sim_id").take(8)} ring_window_ms=${created.optLong("remaining_ms", -1)}")
             if (!await(call, (if (call.node.receptionV2) RING_MS else 25_000L) + 5_000L) { it.optString("candidate_client_id").isNotBlank() })
                 return finish(call, call.finishReason ?: "not_answered")
@@ -231,6 +238,7 @@ class TestCallRunner(
     /** Ends the call on the node (the gateway's "cellular END"), then local media. Idempotent. */
     private fun finish(call: Active, reason: String) {
         if (!call.finished.compareAndSet(false, true)) return
+        GatewayDatabase.get(context).queueRtcTerminal(call.callId,call.node.gatewayId)
         // A host hang-up tears media down before the next snapshot poll
         // arrives, so a media failure is first checked against the node.
         val cause = if (!reason.startsWith("media_")) reason else runCatching { call.node.control.get(call.callId) }.getOrNull()
@@ -249,6 +257,11 @@ class TestCallRunner(
                 } catch (_: Exception) {}
                 Thread.sleep(300L * attempt)
             }
+        }
+        if (reported) {
+            call.snapshot = (call.snapshot ?: JSONObject()).put("state","ended")
+            GatewayDatabase.get(context).acknowledgeRtcTerminal(call.callId,call.node.gatewayId)
+            GatewayDatabase.get(context).forgetTestCall(call.callId)
         }
         runCatching { call.media?.closeAfterControlEnd() }
         val played = if (call.activeAt == 0L) 0L else SystemClock.elapsedRealtime() - call.activeAt

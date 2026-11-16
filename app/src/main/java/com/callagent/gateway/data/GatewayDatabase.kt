@@ -185,6 +185,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
         createMeshTables(db)
         createCallWinnerTable(db)
+        createTestCallTable(db)
     }
 
     /** Additional independent control-server nodes and cross-node command aliases (v7). */
@@ -241,7 +242,23 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             createMeshTables(db)
         }
         if (oldVersion < 10) db.execSQL("ALTER TABLE inbox ADD COLUMN match_digest TEXT")
+        if (oldVersion < 11) createTestCallTable(db)
     }
+
+    private fun createTestCallTable(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS rtc_test_calls (call_id TEXT PRIMARY KEY,node_gateway_id TEXT NOT NULL,created_at INTEGER NOT NULL)")
+    }
+    fun rememberTestCall(callId: String, node: String) {
+        writableDatabase.execSQL("INSERT OR IGNORE INTO rtc_test_calls VALUES(?,?,?)", arrayOf(callId,node,System.currentTimeMillis()))
+    }
+    fun recoverTestCalls(node: String, active: String?) {
+        writableDatabase.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) SELECT call_id,node_gateway_id,'ended' FROM rtc_test_calls WHERE node_gateway_id=? AND call_id<>?",arrayOf(node,active ?: ""))
+    }
+    // A create can commit after an early 404. Retain its terminal across that window.
+    fun testCreateMayBePending(callId: String): Boolean = readableDatabase.rawQuery(
+        "SELECT 1 FROM rtc_test_calls WHERE call_id=? AND created_at>?",arrayOf(callId,(System.currentTimeMillis()-120_000).toString())
+    ).use{it.moveToFirst()}
+    fun forgetTestCall(callId: String) { writableDatabase.delete("rtc_test_calls","call_id=?",arrayOf(callId)) }
 
     private fun createCallWinnerTable(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE rtc_cellular_slot (singleton INTEGER PRIMARY KEY CHECK(singleton=1),call_id TEXT NOT NULL UNIQUE REFERENCES call_ledger(call_id))")
@@ -1983,7 +2000,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
         private const val TAG = "GatewayDatabase"
-        private const val VERSION = 10
+        private const val VERSION = 11
         /** client_id of a decline: it ends the call for every host. */
         private const val DECLINED_BY_HOST = "declined_by_host"
         private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +

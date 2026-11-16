@@ -116,18 +116,31 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 node.renewalAt=now
             }
             if(!node.supported)return
+            GatewayDatabase.get(context).recoverTestCalls(node.gatewayId,testCalls.activeCall(node.gatewayId))
             GatewayDatabase.get(context).rtcTerminals(node.gatewayId).forEach{(id,kind)->
                 try {
                     val snapshot=node.control.get(id)
                     // A node that does not know a decline for every host is told the call ended.
                     if(snapshot.getString("state")!="ended")node.control.operation(id,if(kind=="declined"&&!node.globalDecline)"ended" else kind)
                     GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
-                }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
+                    GatewayDatabase.get(context).forgetTestCall(id)
+                }catch(error:MediaApiException){if(error.status==404){
+                    if(!GatewayDatabase.get(context).testCreateMayBePending(id)){
+                        GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
+                        GatewayDatabase.get(context).forgetTestCall(id)
+                    }
+                }else throw error}
             }
             val list=node.control.list();val calls=list.calls;node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
             node.liveCalls=calls.any{it.optString("state") in SETTING_UP}
             if(!wasReady)orchestrator.onRtcNodeReady()
-            calls.forEach{testCalls.onSnapshot(node,it);orchestrator.onRtcControlSnapshot(node,it)}
+            calls.forEach{
+                if(it.optBoolean("test") && it.optString("state")!="ended" && testCalls.activeCall(node.gatewayId)!=it.optString("call_id")) {
+                    GatewayDatabase.get(context).rememberTestCall(it.getString("call_id"),node.gatewayId)
+                    GatewayDatabase.get(context).queueRtcTerminal(it.getString("call_id"),node.gatewayId)
+                }
+                testCalls.onSnapshot(node,it);orchestrator.onRtcControlSnapshot(node,it)
+            }
             if(node.testCalls)testCalls.onRequests(node,list.testRequests)
         }catch(_:Throwable){
             node.ready=false
