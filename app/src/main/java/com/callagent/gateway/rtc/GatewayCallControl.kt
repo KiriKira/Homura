@@ -36,6 +36,8 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         @Volatile var globalDecline = false
         /** The node advertises incoming_ring_until_end: its hosts ring until the cellular call ends. */
         @Volatile var ringUntilEnd = false
+        /** The node advertises test_call_v1: hosts may ask this gateway for test calls. */
+        @Volatile var testCalls = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
         var cheapControl = false
@@ -50,6 +52,10 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     private val incomingOffers=ConcurrentHashMap<String,IncomingForkCoordinator>()
     private val reconciler=Executors.newSingleThreadScheduledExecutor { Thread(it,"RTC-Gateway-Nodes") }
     val ready: Boolean get()=nodes.values.any{it.ready}
+    private val testCalls=TestCallRunner(context,{incomingOffers.isEmpty()&&orchestrator.idleForTestCall()}){line->orchestrator.listener?.onAudioStats(line)}
+    /** Ends any test call before a real cellular call is offered; true once its node has it ended. */
+    fun preemptTestCall(timeoutMs:Long=3_000L)=testCalls.preempt(timeoutMs)
+    val testCallActive:Boolean get()=testCalls.busy
     fun start(){reconciler.scheduleWithFixedDelay(::reconcile,0,10,TimeUnit.SECONDS)}
     private fun reconcile(){
         if(closed.get())return
@@ -97,6 +103,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 node.receptionV2=capabilities.optBoolean("reception_v2",false)
                 node.globalDecline=capabilities.optBoolean("global_decline_v1",false)
                 node.ringUntilEnd=capabilities.optBoolean("incoming_ring_until_end",false)
+                node.testCalls=capabilities.optBoolean("test_call_v1",false)
                 node.checked=true;node.capabilityAt=now
                 if(capabilities.optBoolean("ice_servers_v1"))RelayRepository.observeNode(context,"node-"+node.gatewayId,"节点 "+node.gatewayId.take(8))
                 node.cheapControl=capabilities.optJSONArray("extensions")?.let{list->(0 until list.length()).any{list.optString(it)=="rtc_control_ws_v1"}}==true
@@ -117,10 +124,11 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                     GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
                 }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
             }
-            val calls=node.control.calls();node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
+            val list=node.control.list();val calls=list.calls;node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
             node.liveCalls=calls.any{it.optString("state") in SETTING_UP}
             if(!wasReady)orchestrator.onRtcNodeReady()
-            calls.forEach{orchestrator.onRtcControlSnapshot(node,it)}
+            calls.forEach{testCalls.onSnapshot(node,it);orchestrator.onRtcControlSnapshot(node,it)}
+            if(node.testCalls)testCalls.onRequests(node,list.testRequests)
         }catch(_:Throwable){
             node.ready=false
             if(System.nanoTime()-node.lastSeen>15_000_000_000L)orchestrator.onRtcControlLost(node)
@@ -203,6 +211,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
 
     override fun close(){
         if(!closed.compareAndSet(false,true))return
+        testCalls.close()
         reconciler.shutdownNow();workers.values.forEach{it.shutdownNow()};workers.clear();nodes.clear()
     }
 }

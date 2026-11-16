@@ -75,7 +75,8 @@ object NodeControlSocket {
                         val result=JSONObject(text);if(result.getInt("version")!=1){close();return}
                         if(result.optString("event")=="snapshot"){
                             epoch.incrementAndGet();idle.clear()
-                            snapshot=JSONObject().put("version",1).put("calls",result.getJSONArray("calls")).put("poll_after_ms",750);snapshotAt=now();hint(base);return
+                            snapshot=JSONObject().put("version",1).put("calls",result.getJSONArray("calls")).put("poll_after_ms",750)
+                                .apply{result.optJSONArray("test_call_requests")?.let{put("test_call_requests",it)}};snapshotAt=now();hint(base);return
                         }
                         val id=result.getString("request_id");val path=paths.remove(id)
                         if(path=="/auth/refresh"&&result.optInt("status")==200){
