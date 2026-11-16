@@ -85,14 +85,17 @@ class TestCallRunner(
         val call = active ?: return
         if (call.node !== node || snapshot.optString("call_id") != call.callId) return
         call.snapshot = snapshot
+        endReason(snapshot)?.let { reason -> runCatching { ender.execute { finish(call, reason) } } }
+    }
+
+    /** Why the node says the call is over, or null while it is not. */
+    private fun endReason(snapshot: JSONObject): String? {
         val state = snapshot.optString("state")
-        if (snapshot.optBoolean("end_requested") || state == "ended" || state == "unknown") {
-            val reason = when {
-                state == "unknown" -> "control_expired"
-                snapshot.optString("reason").isNotBlank() -> "remote_" + snapshot.optString("reason")
-                else -> "remote_end"
-            }
-            runCatching { ender.execute { finish(call, reason) } }
+        if (!snapshot.optBoolean("end_requested") && state != "ended" && state != "unknown") return null
+        return when {
+            state == "unknown" -> "control_expired"
+            snapshot.optString("reason").isNotBlank() -> "remote_" + snapshot.optString("reason")
+            else -> "remote_end"
         }
     }
 
@@ -228,7 +231,11 @@ class TestCallRunner(
     /** Ends the call on the node (the gateway's "cellular END"), then local media. Idempotent. */
     private fun finish(call: Active, reason: String) {
         if (!call.finished.compareAndSet(false, true)) return
-        call.finishReason = reason
+        // A host hang-up tears media down before the next snapshot poll
+        // arrives, so a media failure is first checked against the node.
+        val cause = if (!reason.startsWith("media_")) reason else runCatching { call.node.control.get(call.callId) }.getOrNull()
+            ?.also { call.snapshot = it }?.let(::endReason) ?: reason
+        call.finishReason = cause
         call.feeder?.cancel(false)
         // A create that failed ambiguously may still have committed: end it if the node has it.
         if (call.snapshot == null) call.snapshot = runCatching { call.node.control.get(call.callId) }.getOrNull()
@@ -245,7 +252,7 @@ class TestCallRunner(
         }
         runCatching { call.media?.closeAfterControlEnd() }
         val played = if (call.activeAt == 0L) 0L else SystemClock.elapsedRealtime() - call.activeAt
-        event(call, "test_call_finished reason=$reason reported_ended=$reported played_ms=$played frames=${call.framesFed}" +
+        event(call, "test_call_finished reason=$cause${if (cause != reason) " local_reason=$reason" else ""} reported_ended=$reported played_ms=$played frames=${call.framesFed}" +
             " late_ticks=${call.lateTicks} max_tick_gap_ms=${call.maxTickGapMs}")
         synchronized(this) { if (active === call) active = null }
         call.done.countDown()

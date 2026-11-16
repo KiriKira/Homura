@@ -69,12 +69,16 @@ internal class CallQuality(private val clock: () -> Long = System::nanoTime) {
             local?.text("relayProtocol") ?: "-", family
         ).joinToString(" ")
         val lines = mutableListOf<String>()
-        if (path != null && path != describe) {
-            pathChanges++
-            lines += "path_changed from=${path!!.replace(' ', ',')} to=${describe.replace(' ', ',')}"
+        // Before ICE selects a pair there is no path; it is neither a path
+        // nor a change, so the first real path is not counted as one.
+        if (pair != null && local != null) {
+            if (path != null && path != describe) {
+                pathChanges++
+                lines += "path_changed from=${path!!.replace(' ', ',')} to=${describe.replace(' ', ',')}"
+            }
+            path = describe
+            paths += describe.substringBefore(' ')
         }
-        path = describe
-        paths += describe.substringBefore(' ')
 
         val seconds = ((now.at - before.at) / 1e9).coerceAtLeast(0.001)
         val received = now.rxPackets - before.rxPackets

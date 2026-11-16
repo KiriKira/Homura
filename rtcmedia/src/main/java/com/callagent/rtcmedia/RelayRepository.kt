@@ -21,7 +21,13 @@ object RelayRepository {
     private const val KEY = "rtc-relay-sources-v1"
     private val watchdog=Executors.newSingleThreadScheduledExecutor { r -> Thread(r,"Relay-Deadline").apply{isDaemon=true} }
     private val workers = Executors.newFixedThreadPool(8) { r -> Thread(r,"Relay-Prepare").apply { isDaemon=true } }
-    private data class Cache(val identity:String,val source:RelaySource,val expires:Long)
+    private data class Cache(val identity:String,val source:RelaySource,val expires:Long,val fetchedAt:Long=System.currentTimeMillis())
+    /** Credentials from an external source are refetched at least hourly even
+     * when they live longer, so a token revoked at its source stops being used
+     * within an hour. Node credentials follow the node's own expiry. */
+    internal const val EXTERNAL_MAX_AGE_MS=3_600_000L
+    internal fun reusable(expires:Long,fetchedAt:Long,external:Boolean,now:Long):Boolean =
+        expires-now>1_800_000L&&(!external||now-fetchedAt in 0 until EXTERNAL_MAX_AGE_MS)
     private val probes = ConcurrentHashMap<String,Pair<Long,Long?>>()
     private class Provider(val name:String,val identity:String,val fetch:()->JSONObject?)
     private val nodeProviders=ConcurrentHashMap<String,Provider>()
@@ -121,7 +127,7 @@ object RelayRepository {
             }else{
                 val identity=scope+":"+item.optString("url",id)+":"+item.optString("token")+":"+nodeProviders[id]?.identity.orEmpty()
                 val cached=cache[id]?.takeIf{it.identity==identity}
-                if(cached!=null&&cached.expires-System.currentTimeMillis()>1_800_000L){ready.add(pinned to cached.source);continue}
+                if(cached!=null&&reusable(cached.expires,cached.fetchedAt,item.getString("type")=="external",System.currentTimeMillis())){ready.add(pinned to cached.source);continue}
                 pending++
                 futures.add(completion.submit(Callable {
                     val mine=CompletableFuture<Pair<Boolean,RelaySource>?>()

@@ -44,5 +44,17 @@ class CallQualityTest {
         assertTrue(summary, summary.contains(" path_changes=1 paths=relay/srflx,srflx/srflx"))
     }
 
+    @Test fun noPathBeforeIceSelectsOneIsNeitherAPathNorAChange() {
+        var now = 0L
+        val quality = CallQuality { now }
+        now = 1_000_000_000L
+        val early = report(0, 0, 0, 0, 0, 0.0).filter { it.type != "transport" && it.type != "candidate-pair" }
+        assertTrue(quality.sample(early).single().contains(" path=none/none "))
+        now = 6_000_000_000L
+        assertEquals(1, quality.sample(report(250, 0, 20_000, 240_000, 0, 0.010)).size)
+        val summary = checkNotNull(quality.summary())
+        assertTrue(summary, summary.endsWith(" path_changes=0 paths=relay/srflx"))
+    }
+
     @Test fun noSampleMeansNoSummary() { assertNull(CallQuality().summary()) }
 }
