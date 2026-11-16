@@ -31,6 +31,7 @@ internal class NativePeer(
     private val connected = CountDownLatch(1)
     private val localCandidates = LocalIceQueue<IceCandidate>()
     private val candidateBudget=CandidateBudget()
+    private val quality=CallQuality()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
     // Count native callbacks before trickle filtering; diagnostics concern actual gathering.
     private val gatheredCandidateCount = java.util.concurrent.atomic.AtomicInteger()
@@ -247,6 +248,7 @@ internal class NativePeer(
                 (local.members["url"] as? String)?.let(relayOrigins)?.sorted()?.joinToString(",")?.ifEmpty { "unknown" } ?: "unknown"
             } else if (local == null) "unknown" else "direct"
             onEvent("stats selected_pair=$selected relay_sources=$relaySource tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
+            runCatching{quality.sample(report.statsMap.values.map{QualityStat(it.id,it.type,it.members)}).forEach(onEvent)}
         }
     }
     override fun close(){
@@ -260,6 +262,7 @@ internal class NativePeer(
             runCatching{peer.dispose()}
             runCatching{track.dispose()};runCatching{source.dispose()};runCatching{factory.dispose()};runCatching{module.release()}
         }
+        runCatching{quality.summary()?.let(onEvent)}
         scheduler.shutdownNow();pcm?.clear();onEvent("native_closed")
     }
 }
