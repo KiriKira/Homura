@@ -199,7 +199,8 @@ class TestCallRunner(
         }
     }
 
-    /** Feeds one 20 ms frame per tick and logs playback progress every 10 s. */
+    /** Feeds one 20 ms frame per tick, looping the recording until either side
+     * hangs up (at most [MAX_PLAY_FRAMES]), and logs progress every 10 s. */
     private fun play(call: Active, pcm: PcmBridge, music: ShortArray) {
         val frames = (music.size + TestCallAudio.FRAME_SAMPLES - 1) / TestCallAudio.FRAME_SAMPLES
         var lastTick = 0L
@@ -213,13 +214,13 @@ class TestCallRunner(
             }
             lastTick = now
             val index = call.framesFed
-            if (index >= frames) {
-                runCatching { ender.execute { finish(call, "finished") } }
+            if (index >= MAX_PLAY_FRAMES) {
+                runCatching { ender.execute { finish(call, "max_duration") } }
                 return@scheduleAtFixedRate
             }
-            runCatching { pcm.capture(TestCallAudio.frame(music, index), TestCallAudio.RATE) }
+            runCatching { pcm.capture(TestCallAudio.frame(music, index % frames), TestCallAudio.RATE) }
             call.framesFed = index + 1
-            if ((index + 1) % 500 == 0) event(call, "test_call_playback position_s=${(index + 1) / 50} of_s=${frames / 50}" +
+            if ((index + 1) % 500 == 0) event(call, "test_call_playback played_s=${(index + 1) / 50} loop=${index / frames + 1} position_s=${(index % frames + 1) / 50} of_s=${frames / 50}" +
                 " late_ticks=${call.lateTicks} max_tick_gap_ms=${call.maxTickGapMs} pcm_overruns=${pcm.overruns.get()} pcm_underruns=${pcm.underruns.get()}")
         }, 0, 20, TimeUnit.MILLISECONDS)
     }
@@ -256,5 +257,9 @@ class TestCallRunner(
         worker.shutdownNow(); audioLoader.shutdownNow(); clock.shutdownNow(); ender.shutdown()
     }
 
-    private companion object { const val RING_MS = 60_000L }
+    private companion object {
+        const val RING_MS = 60_000L
+        /** 30 minutes of 20 ms frames: long enough for relay and revocation tests. */
+        const val MAX_PLAY_FRAMES = 30 * 60 * 50
+    }
 }

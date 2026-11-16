@@ -56,8 +56,8 @@ Madoka 另覆盖加密存储、账户/401 失效、7 来源共同截止时间，
 ## 测试通话与音质日志
 
 节点声明 `test_call_v1` 时，Madoka“设置 → 服务器”下的“测试通话”按钮请求旧手机发起一次测试通话：Homura 不接触 Telecom、
-不拨蜂窝电话，用服务器的普通来电流程只振铃发起请求的这台主机；接听后播放内置音乐（muque「いいんじゃない」，约 93 秒），
-放完或任一方挂断即结束。旧手机有通话或另一次测试时请求被拒（GATEWAY_BUSY）；测试中来了真实电话，测试立刻结束、让出线路。
+不拨蜂窝电话，用服务器的普通来电流程只振铃发起请求的这台主机；接听后循环播放内置音乐（muque「いいんじゃない」，一遍约 93 秒），
+直到任一方挂断，最长 30 分钟，可用于中继、吊销等需要长通话的测试。旧手机有通话或另一次测试时请求被拒（GATEWAY_BUSY）；测试中来了真实电话，测试立刻结束、让出线路。
 强制中继构建同样适用，可用于比较不同网络、不同中继下的音质。
 
 按 `call_id` 检索两部手机的日志（`adb logcat -s GsmRtc`；Madoka 的运行日志、Homura 的运行日志页也有同样内容）：
@@ -66,8 +66,8 @@ Madoka 另覆盖加密存储、账户/401 失效、7 来源共同截止时间，
 - Homura：每个阶段一行，`elapsed_ms` 从收到请求起计：`test_call_accepted`、`test_call_ringing`、`test_call_answered`、
   `test_call_media_admitted`、`test_call_negotiated`、`test_call_winner`、`test_call_connected`、
   `test_call_audio_ready`（解码耗时与采样率）、`test_call_active`；播放中每 10 秒 `test_call_playback`
-  （位置、`late_ticks`/`max_tick_gap_ms`：送音频的 20 ms 定时器是否被系统拖慢，`pcm_overruns`/`pcm_underruns`）；
-  结束时 `test_call_finished reason=…`（`finished`、`remote_…`、`control_expired`、`preempted_by_cellular_call`、`media_…` 等）。
+  （已播放时长、第几遍、`late_ticks`/`max_tick_gap_ms`：送音频的 20 ms 定时器是否被系统拖慢，`pcm_overruns`/`pcm_underruns`）；
+  结束时 `test_call_finished reason=…`（`max_duration`、`remote_…`、`control_expired`、`preempted_by_cellular_call`、`media_…` 等）。
 - 两部手机、所有通话（不只测试通话）每 5 秒一行 `quality`，按上一次采样以来的区间统计：
   `path`（本端/对端候选类型）、`net`（wifi/cellular）、`proto`、`relay_proto`（udp/tcp/tls）、`family`（v4/v6），
   `rtt_ms`/`remote_rtt_ms`、`in_kbps`/`out_kbps`/`avail_out_kbps`、`rx_pkts`/`rx_lost`/`rx_loss_pct`、
