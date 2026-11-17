@@ -77,8 +77,15 @@ class TestCallRunner(
             return
         }
         val call = Active(node, requestId, UUID.randomUUID().toString())
-        GatewayDatabase.get(context).rememberTestCall(call.callId,node.gatewayId)
         synchronized(this) { if (active != null) return; active = call }
+        // Remembered only once this request owns the runner: a request that
+        // lost the slot to another node never creates a call to recover.
+        // Polls of this node run on this thread, so none can see the call
+        // active but unremembered.
+        if (runCatching { GatewayDatabase.get(context).rememberTestCall(call.callId, node.gatewayId) }.isFailure) {
+            synchronized(this) { if (active === call) active = null }
+            return
+        }
         try { worker.execute { run(call) } } catch (_: Exception) { synchronized(this) { if (active === call) active = null } }
     }
 

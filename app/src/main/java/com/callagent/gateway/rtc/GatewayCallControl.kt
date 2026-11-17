@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val LIVE_POLL_MS=250L
 private const val IDLE_POLL_NANOS=750_000_000L
+private const val CREATE_CHECK_MS=5_000L
 private val SETTING_UP=setOf("reserved","pending_wakeup","ringing","dialing","connecting")
 
 /** Per-node authenticated control loops. They share exactly one physical
@@ -50,6 +51,8 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     private val nodes=ConcurrentHashMap<String,Node>()
     private val workers=ConcurrentHashMap<String,java.util.concurrent.ScheduledExecutorService>()
     private val incomingOffers=ConcurrentHashMap<String,IncomingForkCoordinator>()
+    /** Test calls whose create may still commit: next check, elapsed realtime. */
+    private val createChecks=ConcurrentHashMap<String,Long>()
     private val reconciler=Executors.newSingleThreadScheduledExecutor { Thread(it,"RTC-Gateway-Nodes") }
     val ready: Boolean get()=nodes.values.any{it.ready}
     private val testCalls=TestCallRunner(context,{incomingOffers.isEmpty()&&orchestrator.idleForTestCall()}){line->orchestrator.listener?.onAudioStats(line)}
@@ -118,17 +121,19 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             if(!node.supported)return
             GatewayDatabase.get(context).recoverTestCalls(node.gatewayId,testCalls.activeCall(node.gatewayId))
             GatewayDatabase.get(context).rtcTerminals(node.gatewayId).forEach{(id,kind)->
+                if((createChecks[id]?:0L)>android.os.SystemClock.elapsedRealtime())return@forEach
                 try {
                     val snapshot=node.control.get(id)
                     // A node that does not know a decline for every host is told the call ended.
                     if(snapshot.getString("state")!="ended")node.control.operation(id,if(kind=="declined"&&!node.globalDecline)"ended" else kind)
                     GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
-                    GatewayDatabase.get(context).forgetTestCall(id)
+                    GatewayDatabase.get(context).forgetTestCall(id);createChecks.remove(id)
                 }catch(error:MediaApiException){if(error.status==404){
                     if(!GatewayDatabase.get(context).testCreateMayBePending(id)){
                         GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
-                        GatewayDatabase.get(context).forgetTestCall(id)
-                    }
+                        GatewayDatabase.get(context).forgetTestCall(id);createChecks.remove(id)
+                    // A create that may still commit is checked every few seconds, not every poll.
+                    }else createChecks[id]=android.os.SystemClock.elapsedRealtime()+CREATE_CHECK_MS
                 }else throw error}
             }
             val list=node.control.list();val calls=list.calls;node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
