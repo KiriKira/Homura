@@ -29,6 +29,9 @@ dependencies {
     // library's lint AAR. Both modules compile against the same pinned SDK.
     compileOnly(files(sdkOutput.map { it.file("external-playout.aar") }).builtBy(prepareSdk))
     implementation("androidx.annotation:annotation:1.9.1")
+    // The relay settings page uses the apps' Material 3 theme; same versions as both apps.
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.14.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     testImplementation("org.json:json:20240303")

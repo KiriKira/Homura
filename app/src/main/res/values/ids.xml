@@ -45,6 +45,7 @@
     <item name="btnOpenNotificationSettings" type="id" />
     <item name="btnOpenBatterySettings" type="id" />
     <item name="btnCfgLogs" type="id" />
+    <item name="settingsTurnRelay" type="id" />
     <item name="btnLogsBack" type="id" />
     <item name="btnLogsCopy" type="id" />
     <item name="btnLogsClear" type="id" />
