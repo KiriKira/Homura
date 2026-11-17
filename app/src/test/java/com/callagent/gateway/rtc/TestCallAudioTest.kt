@@ -20,6 +20,19 @@ class TestCallAudioTest {
         assertArrayEquals(shortArrayOf(5, -5), TestCallAudio.toMono16k(shortArrayOf(5, -5), 1, 16000))
     }
 
+    @Test fun resamplingKeepsTheBandAndRejectsWhatWouldAlias() {
+        fun tone(hz: Double, rate: Int) = ShortArray(rate) { (10000 * Math.sin(2 * Math.PI * hz * it / rate)).toInt().toShort() }
+        // RMS over the middle, away from the clamped edges.
+        fun rms(pcm: ShortArray) = Math.sqrt(pcm.copyOfRange(2000, pcm.size - 2000).sumOf { it.toDouble() * it } / (pcm.size - 4000))
+        for (rate in listOf(44100, 48000)) {
+            val passband = rms(TestCallAudio.toMono16k(tone(1000.0, rate), 1, rate))
+            assertEquals(10000 / Math.sqrt(2.0), passband, 150.0)
+            // 12 kHz folds to 4 kHz at 16 kHz; linear interpolation let it through at about -6 dB.
+            val aliased = rms(TestCallAudio.toMono16k(tone(12000.0, rate), 1, rate))
+            assertTrue("rate=$rate aliased rms=$aliased", aliased < passband / 300)
+        }
+    }
+
     @Test fun framesAre20msLittleEndianAndPadWithSilence() {
         val pcm = ShortArray(TestCallAudio.FRAME_SAMPLES + 10) { 0x1234 }
         val first = TestCallAudio.frame(pcm, 0)
