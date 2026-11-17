@@ -3,7 +3,8 @@ name: Homura signed releases
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # Stable tags only: prerelease tags such as v1.0.2-dev3 must not rebuild as stable.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
     inputs:
       publish:
@@ -31,6 +32,9 @@ jobs:
     steps:
       - name: Check out release source
         uses: actions/checkout@v4
+        with:
+          # Prerelease names count main revisions since the last stable tag.
+          fetch-depth: 0
 
       - name: Compute immutable release identity
         id: release_metadata
@@ -62,8 +66,19 @@ jobs:
             release_name="$tag"
             prerelease=false
           else
-            tag="build-${GITHUB_RUN_NUMBER}-${sha7}"
-            version_name="0.4.2-${tag}"
+            # Prereleases are named after the next patch version: v1.0.2-dev3 is
+            # the third main revision after v1.0.1 (merges on main's first-parent
+            # line), so the name says what it is and sorts below v1.0.2.
+            stable="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*' HEAD 2>/dev/null || true)"
+            if [[ "$stable" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              next="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+              dev="$(git rev-list --count --first-parent "$stable..HEAD")"
+            else
+              next="v0.0.1"
+              dev="$(git rev-list --count --first-parent HEAD)"
+            fi
+            tag="${next}-dev${dev}"
+            version_name="$tag"
             release_name="$tag"
             prerelease=true
             if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then

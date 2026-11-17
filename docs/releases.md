@@ -39,7 +39,7 @@ The certificate fingerprint is public. Keep the keystore and passwords in the pr
 
 ## Build and publication triggers
 
-- Every push to `main` runs tests, lint, Magisk checks, and a signed release build. It publishes a prerelease named `build-<run number>-<short commit>` with version name `0.4.0-build-<run number>-<short commit>`.
+- Every push to `main` runs tests, lint, Magisk checks, and a signed release build. It publishes a prerelease whose tag and version name are `v<next patch>-dev<N>`, such as `v1.0.2-dev3`: `N` counts the commits on `main`'s first-parent line since the latest stable tag, so each merge gets the next number. Prerelease tags never trigger a stable build.
 - A tag matching `vMAJOR.MINOR.PATCH` publishes a stable release whose tag and version name are the tag itself.
 - `workflow_dispatch` defaults to `publish=true`. From `main`, set it to `false` to build and verify without creating a GitHub Release. Other branches run a debug-only validation build without release signing or publication; manually dispatched tags can build a signed artifact but do not publish.
 
