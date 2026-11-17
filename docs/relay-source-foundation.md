@@ -1,0 +1,88 @@
+# 中继来源与 Worker 控制传输实现
+
+本批实现 T1–T4 及 T6 手机侧协商。默认只使用节点准入时，URL 的顺序、分组、重复项与可选凭据保持原样。
+
+## 来源与排序
+
+设置入口“中继来源”支持静态 TURN、已配对节点和 HTTPS 来源链接/二维码；来源可以关闭、单独置顶或移除。
+`mahogsm://relay?url=...&token=...` 明确确认后才保存/访问；HTTPS、参数唯一性、端口和 token 边界严格检查。
+节点声明 `ice_servers_v1` 时复用其原会话，不另发 Cloudflare API token。来源列表用 Android Keystore AES/GCM 加密，既有备份规则排除全部私有配置。
+存储损坏要求显式清除重建；通话仍可使用节点准入。账户、会话身份、配置代际隔离凭据缓存；401/403 清除来源缓存，不以旧凭据回退。
+
+通话准备并行获取来源，共用 1.5 秒截止时间；同一身份/来源的并发刷新合并，剩余 30 分钟触发刷新、至少留 30 秒安全余量；外部来源（GriefSeed 等）的凭据无论有效期多长，至少每小时重新获取一次，来源端吊销的令牌最迟一小时内不再被使用（已建立的通话不受影响）。
+STUN RTT 按网络缓存 5 分钟，仅作为初始顺序提示，失败保留 TCP/TLS 等回退；用户置顶优先。
+Madoka 振铃只预取来源，不申请媒体、不创建 PeerConnection、不启动 30 秒媒体协商期限。
+
+只有 URL、用户名和密码相同才合并。重复 URL 的不同凭据在 native 创建前做真实 TURN challenge/认证 Allocate 的有界选择，
+成功后尽力以 lifetime=0 释放临时 allocation；不同地址并行，共用 1.2 秒上限。无验证成功时保留首选供普通 ICE 尝试。
+这避免依赖固定 SDK 对同一地址多组凭据的去重行为；配置中的备用凭据不会被删除。来源准备和该鉴权检查各有独立上限。
+
+最多 8 来源（含当前节点）、16 组 server、32 个 URL；URL 数不是候选数。
+总量超预算时先为当前节点预留容量，再按置顶/RTT 顺序保留能容纳的完整附加来源，记录 `relay_sources_truncated`；不会因此让媒体构造失败。节点本身已超预算时保留原列表，跳过所有附加来源，维持旧路径兼容。
+其他附加配置校验异常在媒体边界回退节点列表，记录 `relay_sources_fallback`；设置输入仍严格校验。
+多来源模式按类型限制实际 trickle：relay 64、host 32、reflexive 32，给 IPv4/IPv6/多网卡直连留余量；节点单来源保持原行为。
+自建地址的自定义端口、TLS 5349/53 不被 Cloudflare 的端口规则误过滤。来源 ID 映射保留到选中候选统计；日志与通话界面显示来源或直连，未知归属明确显示待确认。
+
+## 可选控制连接
+
+仅在节点声明 `rtc_control_ws_v1` 后使用独立控制 WebSocket，HTTP 与旧 `/v1/ws` 仍保留。
+共享连接复用 RTC、短信及网关心跳；已有控制连接可承担同步提示，避免另一条 wake 连接因 token 刷新重复握手。
+控制消息带 request_id，副作用继续使用原 operation_id/Idempotency-Key；超时和连接故障用原载荷回退 HTTP。
+连接内 refresh 先更新连接身份，再交给会话存储；过期/撤销、429 Retry-After、能力回滚及断连使缓存或传输能力失效。
+
+空呼叫/命令/事件可缓存至通知或断连；活动呼叫仍至少每 5 秒真实续租，收到服务器快照也不能延后此截止时间。
+握手连接数限流只退避握手，不阻断 HTTP 续租；设备日限额为结束及必要 CAS 读取保留有界预算。
+冷备节点仅在主节点健康时暂停非活动探测，失败的同轮重新探测并激活；无推送仍可恢复。
+网关真实心跳约 60 秒一次，持久 ACK 后推进 sequence。两端快速断连不清零退避计数，稳定 60 秒后才重置。网络恢复和身份刷新成功可提前普通重试计时（Madoka 网络稳定约 2 秒后、Homura 立即尝试），但不能提前服务器 Retry-After 的硬截止时间。
+
+这一限流策略也适用于 SoulGem：节点业务 API 返回 429 后，手机暂停该节点带会话的普通请求至 Retry-After（缺省 60 秒）；结束及必要 CAS 读取保留例外，并非仅 GriefSeed 的行为。
+
+## 验证与设备步骤
+
+自动化：来源合并、鉴权回退、STUN/TLS 边界、链接、候选预算、控制连接刷新、缓存/退避与 HTTP 回退；应用测试、APK 构建和 lint。
+Madoka 另覆盖加密存储、账户/401 失效、7 来源共同截止时间，以及无推送时冷备在同轮激活。
+
+普通调试构建：`./gradlew :app:assembleDebug`。
+强制中继模拟器构建：`./gradlew -PrtcEmulator=true -PforceRtcRelay=true :app:assembleDebug`（arm64/x86_64）。
+强制中继开关仅影响 debug，release 始终保留默认直连策略。
+
+仍需 KVM 模拟器/真机：固定 SDK 的真实选路与来源归属、坏/慢 TURN、UDP 不通但 TLS 可用、当前节点 TURN 关闭、同址凭据媒体回退、
+长振铃接听/预取取消、双主机与蜂窝 END 竞态、Doze/网络切换/重连风暴。当前环境无 `/dev/kvm`，未把 JVM 测试当成媒体通话验收。
+强制中继的通话失败时，若本端一个本地候选都没有，会输出 `event=relay_no_local_candidates`（附来源配置计数，不含地址和凭据）；它只在失败时输出，成功的通话不会出现。
+来源准备耗时以日志 `event=relay_sources_resolved elapsed_ms=... sources=...` 为准：它覆盖获取凭据和 STUN 测速，`native_ready`/`offer_sent` 的计时不包含这一段。
+设备验收还需记录节点单来源及多来源的外呼/接听媒体就绪耗时：来源刷新最多 1.5 秒，同址凭据认证最多另加 1.2 秒，单节点 STUN 测速最多 250ms（按网络缓存 5 分钟）；Homura 两个方向均无预取，Madoka 仅来电振铃预取。
+真实 Cloudflare 的 Deploy、key 权限、已有 allocation 撤销效果与 24 小时用量还需部署者账号验证；本批没有发布生产 Worker。
+
+## 测试通话与音质日志
+
+节点声明 `test_call_v1` 时，Madoka“设置 → 服务器”下的“测试通话”按钮请求旧手机发起一次测试通话：Homura 不接触 Telecom、
+不拨蜂窝电话，用服务器的普通来电流程只振铃发起请求的这台主机；接听后循环播放内置音乐（muque「いいんじゃない」，一遍约 93 秒），
+直到任一方挂断，最长 30 分钟，可用于中继、吊销等需要长通话的测试。旧手机有通话或另一次测试时请求被拒（GATEWAY_BUSY）；测试中来了真实电话，测试立刻结束、让出线路。
+强制中继构建同样适用，可用于比较不同网络、不同中继下的音质。
+
+按 `call_id` 检索两部手机的日志（`adb logcat -s GsmRtc`；Madoka 的运行日志、Homura 的运行日志页也有同样内容）：
+
+- Madoka：`test_call requested request=… gateway=…` 或 `request_failed status=… code=…`；来电各阶段 `control_… test_call=true`。
+- Homura：每个阶段一行，`elapsed_ms` 从收到请求起计：`test_call_accepted`、`test_call_ringing`、`test_call_answered`、
+  `test_call_media_admitted`、`test_call_negotiated`、`test_call_winner`、`test_call_connected`、
+  `test_call_audio_ready`（解码耗时与采样率）、`test_call_active`；播放中每 10 秒 `test_call_playback`
+  （已播放时长、第几遍、`late_ticks`/`max_tick_gap_ms`：送音频的 20 ms 定时器是否被系统拖慢，`pcm_overruns`/`pcm_underruns`）；
+  结束时 `test_call_finished reason=…`（`max_duration`、`remote_…`、`control_expired`、`preempted_by_cellular_call`、`media_…` 等）。
+- 两部手机、所有通话（不只测试通话）每 5 秒一行 `quality`，按上一次采样以来的区间统计：
+  `path`（本端/对端候选类型）、`net`（wifi/cellular）、`proto`、`relay_proto`（udp/tcp/tls）、`family`（v4/v6），
+  `rtt_ms`/`remote_rtt_ms`、`in_kbps`/`out_kbps`/`avail_out_kbps`、`rx_pkts`/`rx_lost`/`rx_loss_pct`、
+  `remote_loss_pct`（对端收到我方的丢包）、`jitter_ms`、`jb_ms`（抖动缓冲平均延迟）、`concealed_pct`/`conceal_events`
+  （丢包隐藏占比，越高越能听出断续）、`codec`、`audio_level`。选中路径变化时立即记 `path_changed from=… to=…`；
+  通话结束时记一行 `quality_summary`（全程丢包率、抖动与 RTT 的平均/最大值、隐藏占比、路径切换次数与经过的路径）。
+  这些行不含 IP、端口、URL 或凭据。
+- 判断方向：听感差且 `rx_loss_pct`/`concealed_pct` 高、`jitter_ms` 大，是网络问题；网络指标正常但 Homura 的
+  `late_ticks` 或 `pcm_overruns`/`pcm_underruns` 持续增长，是旧手机送音频不够及时（CPU、省电策略）。
+
+### 测试通话的异常结束恢复
+
+测试通话在创建前保存 call_id 与节点身份，结束时先持久化 END 补报再关闭媒体。
+本地结束不再表示节点已确认释放；暂时断网或进程重启后复用原 call_id 补报，
+不重新创建通话。启动后也清理节点快照里属于当前网关的孤儿测试通话。
+创建可能仍在途时，404 在两分钟保护窗口内不能清除恢复记录；迟到创建由补报
+或后续快照清理。运行中的测试不会被重启恢复扫描误结束。
+数据库升级至 v11，仅新增测试恢复表，原短信和真实蜂窝通话记录保留。

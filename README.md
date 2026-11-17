@@ -11,6 +11,8 @@ Homura 是三端系统中的旧手机网关：旧 Android 保留两张 SIM，未
 
 更多资料：[界面与后台运行](docs/android-ui-and-background.md)、[实施状态](docs/implementation-state.md)、[设备验收状态](docs/devices.md)、[Magisk 适配](docs/magisk-runtime.md)、[Android 虚拟机使用指南](docs/android-virtual-machine.md)、[自动构建与固定签名](docs/releases.md)。
 
+测试通话播放的音乐为 muque「いいんじゃない」（`app/src/main/res/raw/test_call_music.m4a`），仅用于测试通话；版权归原作者所有。
+
 ## 短信模式无需 root
 
 只收发短信可直接安装普通 APK；启动只申请 `READ_PHONE_STATE`、`SEND_SMS`、

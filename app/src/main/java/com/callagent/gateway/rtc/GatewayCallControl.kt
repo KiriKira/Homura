@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val LIVE_POLL_MS=250L
 private const val IDLE_POLL_NANOS=750_000_000L
+private const val CREATE_CHECK_MS=5_000L
 private val SETTING_UP=setOf("reserved","pending_wakeup","ringing","dialing","connecting")
 
 /** Per-node authenticated control loops. They share exactly one physical
@@ -36,8 +37,12 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         @Volatile var globalDecline = false
         /** The node advertises incoming_ring_until_end: its hosts ring until the cellular call ends. */
         @Volatile var ringUntilEnd = false
+        /** The node advertises test_call_v1: hosts may ask this gateway for test calls. */
+        @Volatile var testCalls = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
+        var cheapControl = false
+        var renewalAt = 0L
         /** The last poll saw a call still being set up: poll at the fast cadence. */
         @Volatile var liveCalls = false
         var lastPollAt = 0L
@@ -46,8 +51,14 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     private val nodes=ConcurrentHashMap<String,Node>()
     private val workers=ConcurrentHashMap<String,java.util.concurrent.ScheduledExecutorService>()
     private val incomingOffers=ConcurrentHashMap<String,IncomingForkCoordinator>()
+    /** Test calls whose create may still commit: next check, elapsed realtime. */
+    private val createChecks=ConcurrentHashMap<String,Long>()
     private val reconciler=Executors.newSingleThreadScheduledExecutor { Thread(it,"RTC-Gateway-Nodes") }
     val ready: Boolean get()=nodes.values.any{it.ready}
+    private val testCalls=TestCallRunner(context,{incomingOffers.isEmpty()&&orchestrator.idleForTestCall()}){line->orchestrator.listener?.onAudioStats(line)}
+    /** Ends any test call before a real cellular call is offered; true once its node has it ended. */
+    fun preemptTestCall(timeoutMs:Long=3_000L)=testCalls.preempt(timeoutMs)
+    val testCallActive:Boolean get()=testCalls.busy
     fun start(){reconciler.scheduleWithFixedDelay(::reconcile,0,10,TimeUnit.SECONDS)}
     private fun reconcile(){
         if(closed.get())return
@@ -62,6 +73,10 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             if(nodes.containsKey(session.gatewayId))return@forEach
             val client=ControlApiClient(context,session.controlBaseUrl,vault,3000)
             val api=MediaApi{method,path,body->client.rtcRequest(method,path,body)}
+            RelayRepository.registerNode("node-"+session.gatewayId,"节点 "+java.net.URI(session.controlBaseUrl).host){
+                val bounded=ControlApiClient(context,session.controlBaseUrl,vault,600)
+                try{if(bounded.capabilityFlags().optBoolean("ice_servers_v1"))bounded.rtcRequest("GET","/rtc/ice-servers",null) else null}catch(e:com.callagent.gateway.net.ControlApiException){throw MediaApiException(e.httpStatus,e.code)}
+            }
             val node=Node(session.gatewayId,api,RtcCallControl(api),primary)
             nodes[node.gatewayId]=node
             val worker=Executors.newSingleThreadScheduledExecutor{Thread(it,"RTC-Gateway-${node.gatewayId.take(8)}")}
@@ -73,6 +88,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 if(live || System.nanoTime()-node.lastPollAt>=IDLE_POLL_NANOS)poll(node,client)
             },0,LIVE_POLL_MS,TimeUnit.MILLISECONDS)
         }
+        RelayRepository.retainNodes(wanted.map{"node-"+it}.toSet())
         (nodes.keys-wanted).forEach{id->workers.remove(id)?.shutdownNow();nodes.remove(id)}
         runCatching{orchestrator.reconcileUnresolvedCellular()}.onFailure{
             Log.w("GsmRtc","event=unknown_call_reconcile_failed error=${it.javaClass.simpleName}")
@@ -83,31 +99,54 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         node.lastPollAt=System.nanoTime()
         try{
             val now=System.nanoTime()
-            if(now-node.capabilityAt>25_000_000_000L){
+            if(node.cheapControl&&!client.controlSocketAdvertised())node.capabilityAt=0L
+            if(now-node.capabilityAt>(if(node.cheapControl)3_600_000_000_000L else 25_000_000_000L)){
                 val capabilities=client.capabilityFlags()
                 node.supported=capabilities.optBoolean("rtc_call_control",false)
                 node.receptionV2=capabilities.optBoolean("reception_v2",false)
                 node.globalDecline=capabilities.optBoolean("global_decline_v1",false)
                 node.ringUntilEnd=capabilities.optBoolean("incoming_ring_until_end",false)
+                node.testCalls=capabilities.optBoolean("test_call_v1",false)
                 node.checked=true;node.capabilityAt=now
+                if(capabilities.optBoolean("ice_servers_v1"))RelayRepository.observeNode(context,"node-"+node.gatewayId,"节点 "+node.gatewayId.take(8))
+                node.cheapControl=capabilities.optJSONArray("extensions")?.let{list->(0 until list.length()).any{list.optString(it)=="rtc_control_ws_v1"}}==true
                 if(!node.supported){node.ready=false;return}
                 check(RtcAudioSession.isAvailable(context)){"RTC_NATIVE_UNAVAILABLE"}
+            }
+            if(node.supported && now-node.renewalAt>(if(node.cheapControl)3_600_000_000_000L else 25_000_000_000L)){
                 node.control.capability(true,node.globalDecline)
                 node.api.request("POST","/devices/self/rtc-capability",JSONObject().put("version",1))
+                node.renewalAt=now
             }
             if(!node.supported)return
+            GatewayDatabase.get(context).recoverTestCalls(node.gatewayId,testCalls.activeCall(node.gatewayId))
             GatewayDatabase.get(context).rtcTerminals(node.gatewayId).forEach{(id,kind)->
+                if((createChecks[id]?:0L)>android.os.SystemClock.elapsedRealtime())return@forEach
                 try {
                     val snapshot=node.control.get(id)
                     // A node that does not know a decline for every host is told the call ended.
                     if(snapshot.getString("state")!="ended")node.control.operation(id,if(kind=="declined"&&!node.globalDecline)"ended" else kind)
                     GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
-                }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
+                    GatewayDatabase.get(context).forgetTestCall(id);createChecks.remove(id)
+                }catch(error:MediaApiException){if(error.status==404){
+                    if(!GatewayDatabase.get(context).testCreateMayBePending(id)){
+                        GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
+                        GatewayDatabase.get(context).forgetTestCall(id);createChecks.remove(id)
+                    // A create that may still commit is checked every few seconds, not every poll.
+                    }else createChecks[id]=android.os.SystemClock.elapsedRealtime()+CREATE_CHECK_MS
+                }else throw error}
             }
-            val calls=node.control.calls();node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
+            val list=node.control.list();val calls=list.calls;node.lastSeen=System.nanoTime();val wasReady=node.ready;node.ready=true
             node.liveCalls=calls.any{it.optString("state") in SETTING_UP}
             if(!wasReady)orchestrator.onRtcNodeReady()
-            calls.forEach{orchestrator.onRtcControlSnapshot(node,it)}
+            calls.forEach{
+                if(it.optBoolean("test") && it.optString("state")!="ended" && testCalls.activeCall(node.gatewayId)!=it.optString("call_id")) {
+                    GatewayDatabase.get(context).rememberTestCall(it.getString("call_id"),node.gatewayId)
+                    GatewayDatabase.get(context).queueRtcTerminal(it.getString("call_id"),node.gatewayId)
+                }
+                testCalls.onSnapshot(node,it);orchestrator.onRtcControlSnapshot(node,it)
+            }
+            if(node.testCalls)testCalls.onRequests(node,list.testRequests)
         }catch(_:Throwable){
             node.ready=false
             if(System.nanoTime()-node.lastSeen>15_000_000_000L)orchestrator.onRtcControlLost(node)
@@ -190,6 +229,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
 
     override fun close(){
         if(!closed.compareAndSet(false,true))return
+        testCalls.close()
         reconciler.shutdownNow();workers.values.forEach{it.shutdownNow()};workers.clear();nodes.clear()
     }
 }

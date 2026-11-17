@@ -77,6 +77,7 @@ internal class WakeConnection(
         fun onSyncRequired()
         fun onClosed(code: Int)
         fun onFailure(httpStatus: Int?)
+        fun onRateLimited(seconds:Long) {}
         fun onInvalidFrame()
     }
 
@@ -127,6 +128,7 @@ internal class WakeConnection(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if(isCurrent()&&response?.code==429)listener.onRateLimited(response.header("Retry-After")?.toLongOrNull()?.coerceIn(1,86400)?:60L)
                 if (isCurrent()) listener.onFailure(response?.code)
             }
         })

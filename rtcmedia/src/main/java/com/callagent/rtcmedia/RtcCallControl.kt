@@ -11,20 +11,32 @@ class RtcCallControl(private val api: MediaApi) {
      * node advertising global_decline_v1. */
     fun capability(enabled: Boolean, globalDecline: Boolean = false) = api.request("POST", "/rtc/control/capability",
         JSONObject().put("version", 1).put("enabled", enabled).apply { if (globalDecline) put("global_decline", true) })
-    fun calls(): List<JSONObject> {
-        val array = api.request("GET", "/rtc/control/calls", null).getJSONArray("calls")
-        return (0 until array.length()).map(array::getJSONObject)
+    fun calls(): List<JSONObject> = list().calls
+    /** The call list and, for a gateway on a test_call_v1 node, its pending test-call requests. */
+    class ControlList(val calls: List<JSONObject>, val testRequests: List<JSONObject>)
+    fun list(): ControlList {
+        val body = api.request("GET", "/rtc/control/calls", null)
+        val array = body.getJSONArray("calls")
+        val tests = body.optJSONArray("test_call_requests")
+        return ControlList((0 until array.length()).map(array::getJSONObject),
+            if (tests == null) emptyList() else (0 until tests.length()).map(tests::getJSONObject))
     }
+    /** Host only, on a node advertising test_call_v1: asks the gateway for a test call
+     * that rings this host. A retry after a network error reuses the operation id. */
+    fun requestTestCall(gateway: String): JSONObject = committed("/rtc/control/test-calls",
+        JSONObject().put("version", 1).put("operation_id", UUID.randomUUID().toString()).put("gateway_id", gateway))
     fun get(id: String) = api.request("GET", "/rtc/control/calls/$id", null)
     /** remainingRingMs, for an incoming call to a node advertising
      * reception_v2 only, is what is left of the call's ring window. */
     fun create(id: String, gateway: String, sim: String, revision: Long, to: String,
-               incoming: Boolean = false, from: String? = null, remainingRingMs: Long? = null): JSONObject {
+               incoming: Boolean = false, from: String? = null, remainingRingMs: Long? = null,
+               testRequestId: String? = null): JSONObject {
         val body = JSONObject().put("version", 1).put("operation_id", UUID.randomUUID().toString())
             .put("call_id", id).put("gateway_id", gateway).put("sim_id", sim)
             .put("mapping_revision", revision).put("to", to)
         from?.let { body.put("from", it) }
         remainingRingMs?.let { body.put("remaining_ring_ms", it) }
+        testRequestId?.let { body.put("test_request_id", it) }
         return committed("/rtc/control/${if (incoming) "incoming" else "calls"}", body)
     }
     fun operation(id: String, kind: String, candidate: String? = null): JSONObject {

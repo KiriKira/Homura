@@ -76,6 +76,14 @@
         android:usesCleartextTraffic="true"
         tools:targetApi="35">
 
+        <activity android:name="com.callagent.rtcmedia.RelaySettingsActivity" android:exported="true" android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mahogsm" android:host="relay" />
+            </intent-filter>
+        </activity>
         <activity
             android:name=".MainActivity"
             android:exported="true"

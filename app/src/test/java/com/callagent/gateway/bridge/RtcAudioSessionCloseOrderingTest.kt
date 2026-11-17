@@ -4,7 +4,6 @@ import com.callagent.rtcmedia.MediaApi
 import com.callagent.rtcmedia.RtcAudioSession
 import org.json.JSONArray
 import org.json.JSONObject
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -54,7 +53,7 @@ class RtcAudioSessionCloseOrderingTest {
         assertTrue("durable control end owns peer teardown", api.requests.isEmpty())
     }
 
-    @Test fun defaultCloseAttemptsSignalingOnceAndIsIdempotent() {
+    @Test fun preparedDefaultCloseDoesNotSignalAndIsIdempotent() {
         val api = RecordingFailingApi()
         val session = newSession(api)
 
@@ -63,6 +62,6 @@ class RtcAudioSessionCloseOrderingTest {
 
         assertTrue(session.isClosed)
         assertTrue(session.awaitShutdown(2_000))
-        assertEquals(listOf(Request("POST", "/rtc/legs/10000000-0000-4000-8000-000000000002")), api.requests.toList())
+        assertTrue("a prepared session has no signaling peer", api.requests.isEmpty())
     }
 }

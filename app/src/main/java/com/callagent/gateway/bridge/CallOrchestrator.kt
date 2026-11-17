@@ -111,6 +111,9 @@ class CallOrchestrator(
     private val incomingRtcLegs = ConcurrentHashMap<String, RtcControlLeg>()
     val rtcControlReady: Boolean get() = rtcControl?.ready == true
 
+    /** No bridge, Telecom call or ringing cellular call: a test call may use the gateway. */
+    fun idleForTestCall(): Boolean = !stopped && bridgeState == BridgeState.IDLE && activeBusinessCallId == null && !cellularLineBusy()
+
     fun onRtcNodeReady() {
         telecomHandler.post { if (!stopped && bridgeState == BridgeState.IDLE) listener?.onStateChanged(BridgeState.IDLE, "Call control ready") }
     }
@@ -261,6 +264,9 @@ class CallOrchestrator(
             check(binding.getString("call_id") == id && binding.getString("gateway_id") == leg.node.gatewayId &&
                 binding.getString("sim_id") == snapshot.getString("sim_id") && binding.getLong("mapping_revision") == snapshot.getLong("mapping_revision")) { "RTC_MEDIA_BINDING_CHANGED" }
             val media = RtcAudioSession(context, authorized, leg.node.api, true, pcm,
+                forceRelay=com.callagent.gateway.BuildConfig.FORCE_RTC_RELAY,
+                currentRelayNodeId="node-"+binding.getString("gateway_id"),
+                additionalRelaySources = com.callagent.rtcmedia.RelayRepository.resolveForCall(context, binding.getString("owner_id"), id, "node-"+binding.getString("gateway_id"),nodeServers=com.callagent.rtcmedia.RelayRepository.servers(authorized.getJSONArray("ice_servers"))),
                 onDigit = { digit -> receiveRtcDigit(digit, gen) }, onFailure = { reason ->
                     if (reason == "server_authorization_closed") {
                         // Control state owns the cellular call; media closure can race ahead of
@@ -851,6 +857,9 @@ class CallOrchestrator(
             // Once a create is attempted, an error ends this call; it is
             // never offered a second time.
             val manager = checkNotNull(rtcControl) { "RTC_CONTROL_NOT_STARTED" }
+            // A real call always wins over a test call; its node must have
+            // released the shared gateway slot before the call is offered.
+            if (manager.testCallActive && !manager.preemptTestCall()) Log.w(TAG, "Test call did not end before an incoming call was offered")
             rtcIncoming = true
             val ringWindow = manager.offerIncoming(mapping, callId, callerNumber, ringStartedAt) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
             // The window runs from the first RINGING, as the nodes were told.

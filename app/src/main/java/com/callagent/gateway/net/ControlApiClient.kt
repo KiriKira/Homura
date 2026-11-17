@@ -122,7 +122,11 @@ class ControlApiClient(
     }
 
     /** The whole public capabilities document, for its feature flags. */
-    fun capabilityFlags(): JSONObject = request("GET", "/v1/capabilities", authenticated = false)
+    fun capabilityFlags(): JSONObject = request("GET", "/v1/capabilities", authenticated = false).also { data ->
+        val list=data.optJSONArray("extensions")?:JSONArray()
+        com.callagent.rtcmedia.NodeControlSocket.observed(base,(0 until list.length()).map(list::getString).toSet()+if(data.optBoolean("ice_servers_v1"))setOf("ice_servers_v1")else emptySet())
+    }
+    fun controlSocketAdvertised()=com.callagent.rtcmedia.NodeControlSocket.supports(base,"rtc_control_ws_v1")
     fun rtcControlAvailable(): Boolean = capabilityFlags().optBoolean("rtc_call_control", false)
 
     fun revoke() {
@@ -293,7 +297,7 @@ class ControlApiClient(
     private fun gatewayId(): String = sessionOrThrow().gatewayId
 
     internal fun rtcRequest(method: String, path: String, body: JSONObject?): JSONObject {
-        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/control/(capability|calls(/[a-zA-Z0-9_-]+(/operations)?)?|incoming)|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
+        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/ice-servers|rtc/control/(capability|calls(/[a-zA-Z0-9_-]+(/operations)?)?|incoming)|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
         val expected = sessionOrThrow()
         return try { request(method, "/v1$path", body, expectedGatewayId = expected.gatewayId) }
         catch (failure: ControlApiException) { throw com.callagent.rtcmedia.MediaApiException(failure.httpStatus, failure.code) }
@@ -319,6 +323,13 @@ class ControlApiClient(
         if (authenticated && expectedGatewayId != null && session?.gatewayId != expectedGatewayId) {
             throw ControlApiException("SESSION_CHANGED","Control identity changed before request")
         }
+        val socketSession=session?:if(path=="/v1/auth/refresh")sessions.load(app) else null
+        if(socketSession!=null)try{
+            com.callagent.rtcmedia.NodeControlSocket.request(base,socketSession.accessToken,method,path.removePrefix("/v1"),body,ioTimeoutMillis?.toLong()?:6000L,idempotencyKey)?.let{return it}
+        }catch(failure:com.callagent.rtcmedia.MediaApiException){
+            if(failure.status==401&&allowRefresh){refreshSession(rejectedAccessToken=socketSession.accessToken);return request(method,path,body,authenticated,idempotencyKey,false,expectedGatewayId)}
+            throw ControlApiException(failure.code,failure.code,failure.status>=500||failure.status==429,failure.status)
+        }
         val url = URL(base + path)
         // HTTPS keeps the platform's default certificate and hostname checks.
         val conn = url.openConnection() as? HttpURLConnection
@@ -338,6 +349,7 @@ class ControlApiClient(
                 conn.outputStream.use { it.write(bytes) }
             }
             val code = conn.responseCode
+            if(code==429)com.callagent.rtcmedia.NodeControlSocket.rateLimited(base,conn.getHeaderField("Retry-After")?.toLongOrNull()?:60L)
             if (code == 401 && authenticated && allowRefresh) {
                 readResponse(conn, success = false)
                 val rejectedToken = session?.accessToken

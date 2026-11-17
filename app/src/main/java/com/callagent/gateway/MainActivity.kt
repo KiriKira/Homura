@@ -203,6 +203,7 @@ class MainActivity : AppCompatActivity() {
             if (callStartTime <= 0) return
             val elapsedMs = System.currentTimeMillis() - callStartTime
             callCardTimer.text = formatElapsed(elapsedMs / 1000)
+            callCardDetail.text = com.callagent.rtcmedia.RelayStatus.latest()?:"WebRTC 语音 · 服务器通话控制"
             // Tick on the second boundary of the call, not 1000ms after
             // whenever this happened to run: a flat delay accumulates the
             // handler's own latency, so the display drifts off the real
@@ -487,6 +488,7 @@ class MainActivity : AppCompatActivity() {
     private fun buildSettingsPage(): LinearLayout {
         val content = verticalRoot()
         content.addView(title("设置"))
+        content.addView(android.widget.Button(this).apply { text = "中继来源"; setOnClickListener { startActivity(android.content.Intent(this@MainActivity, com.callagent.rtcmedia.RelaySettingsActivity::class.java)) } })
 
         content.addView(GatewayUi.groupHeader(this, "服务器与配对"))
         pairedSummary = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
