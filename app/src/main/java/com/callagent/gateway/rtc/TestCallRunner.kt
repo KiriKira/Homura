@@ -198,9 +198,10 @@ class TestCallRunner(
             while (!call.finished.get() && !media.isClosed && SystemClock.elapsedRealtime() < connectedUntil) if (media.awaitConnected(250)) break
             if (!media.isConnected) return finish(call, call.finishReason ?: "media_not_connected")
             event(call, "test_call_connected")
-            val decoded = audio.get(15, TimeUnit.SECONDS)
-            event(call, "test_call_audio_ready samples=${decoded.pcm.size} duration_ms=${decoded.pcm.size * 1000L / TestCallAudio.RATE}" +
-                " source_rate=${decoded.sourceRate} source_channels=${decoded.sourceChannels} decode_ms=${decoded.decodeMs} cached=${decoded.cached}")
+            // The host is told the call is up as soon as media is: a real
+            // answer does not wait for anything else, so neither does the
+            // test. The first decode after an install used to hold the host
+            // at "connecting" for ~10 s here.
             media.enableAudio(true)
             media.markCellularActive()
             val activeUntil = SystemClock.elapsedRealtime() + 5_000
@@ -209,6 +210,11 @@ class TestCallRunner(
             call.node.control.operation(call.callId, "active")
             call.activeAt = SystemClock.elapsedRealtime()
             event(call, "test_call_active")
+            val decoded = audio.get(15, TimeUnit.SECONDS)
+            event(call, "test_call_audio_ready samples=${decoded.pcm.size} duration_ms=${decoded.pcm.size * 1000L / TestCallAudio.RATE}" +
+                " source_rate=${decoded.sourceRate} source_channels=${decoded.sourceChannels} decode_ms=${decoded.decodeMs} cached=${decoded.cached}" +
+                " wait_after_active_ms=${SystemClock.elapsedRealtime() - call.activeAt}")
+            if (call.finished.get()) return
             play(call, pcm, decoded.pcm)
         } catch (error: Throwable) {
             val detail = (error as? MediaApiException)?.let { " status=${it.status} code=${it.code}" } ?: ""
@@ -217,9 +223,30 @@ class TestCallRunner(
     }
 
     /** Feeds one 20 ms frame per tick, looping the recording until either side
-     * hangs up (at most [MAX_PLAY_FRAMES]), and logs progress every 10 s. */
+     * hangs up (at most [MAX_PLAY_FRAMES]), and logs progress every 10 s.
+     *
+     * WebRTC pulls the bridge on its own 10 ms clock. Started empty, the
+     * queue sat at zero to one block and every late tick of this (non
+     * real-time) timer became 10 ms of inserted silence: audible crackle.
+     * [PRIME_FRAMES] are queued first, so the timer may run that late before
+     * WebRTC finds the bridge empty, while the 120 ms bridge still has room
+     * for the catch-up ticks of a fixed-rate schedule. */
     private fun play(call: Active, pcm: PcmBridge, music: ShortArray) {
         val frames = (music.size + TestCallAudio.FRAME_SAMPLES - 1) / TestCallAudio.FRAME_SAMPLES
+        val underrunsBefore = pcm.underruns.get()
+        fun feed(): Boolean {
+            val index = call.framesFed
+            if (index >= MAX_PLAY_FRAMES) {
+                runCatching { ender.execute { finish(call, "max_duration") } }
+                return false
+            }
+            runCatching { pcm.capture(TestCallAudio.frame(music, index % frames), TestCallAudio.RATE) }
+            call.framesFed = index + 1
+            if ((index + 1) % 500 == 0) event(call, "test_call_playback played_s=${(index + 1) / 50} loop=${index / frames + 1} position_s=${(index % frames + 1) / 50} of_s=${frames / 50}" +
+                " late_ticks=${call.lateTicks} max_tick_gap_ms=${call.maxTickGapMs} pcm_overruns=${pcm.overruns.get()} pcm_underruns=${pcm.underruns.get() - underrunsBefore}")
+            return true
+        }
+        repeat(PRIME_FRAMES) { if (!feed()) return }
         var lastTick = 0L
         call.feeder = clock.scheduleAtFixedRate({
             if (call.finished.get()) return@scheduleAtFixedRate
@@ -230,16 +257,8 @@ class TestCallRunner(
                 if (gap > call.maxTickGapMs) call.maxTickGapMs = gap
             }
             lastTick = now
-            val index = call.framesFed
-            if (index >= MAX_PLAY_FRAMES) {
-                runCatching { ender.execute { finish(call, "max_duration") } }
-                return@scheduleAtFixedRate
-            }
-            runCatching { pcm.capture(TestCallAudio.frame(music, index % frames), TestCallAudio.RATE) }
-            call.framesFed = index + 1
-            if ((index + 1) % 500 == 0) event(call, "test_call_playback played_s=${(index + 1) / 50} loop=${index / frames + 1} position_s=${(index % frames + 1) / 50} of_s=${frames / 50}" +
-                " late_ticks=${call.lateTicks} max_tick_gap_ms=${call.maxTickGapMs} pcm_overruns=${pcm.overruns.get()} pcm_underruns=${pcm.underruns.get()}")
-        }, 0, 20, TimeUnit.MILLISECONDS)
+            feed()
+        }, 20, 20, TimeUnit.MILLISECONDS)
     }
 
     /** Ends the call on the node (the gateway's "cellular END"), then local media. Idempotent. */
@@ -286,6 +305,8 @@ class TestCallRunner(
 
     private companion object {
         const val RING_MS = 60_000L
+        /** 60 ms queued ahead of WebRTC's pulls; the bridge holds 120 ms. */
+        const val PRIME_FRAMES = 3
         /** 30 minutes of 20 ms frames: long enough for relay and revocation tests. */
         const val MAX_PLAY_FRAMES = 30 * 60 * 50
     }
