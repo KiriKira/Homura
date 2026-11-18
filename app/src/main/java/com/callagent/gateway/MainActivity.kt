@@ -488,7 +488,6 @@ class MainActivity : AppCompatActivity() {
     private fun buildSettingsPage(): LinearLayout {
         val content = verticalRoot()
         content.addView(title("设置"))
-        content.addView(android.widget.Button(this).apply { text = "中继来源"; setOnClickListener { startActivity(android.content.Intent(this@MainActivity, com.callagent.rtcmedia.RelaySettingsActivity::class.java)) } })
 
         content.addView(GatewayUi.groupHeader(this, "服务器与配对"))
         pairedSummary = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -503,6 +502,9 @@ class MainActivity : AppCompatActivity() {
         meshNodesSection = MeshNodesSection(this, mesh,
             deviceName = { controlDeviceName.text.toString().trim().ifEmpty { Build.MODEL ?: "旧手机网关" } },
             onChanged = { GatewayService.startControl(this) })
+
+        content.addView(GatewayUi.groupHeader(this, "TURN 中继"))
+        content.addView(turnRelayTile())
 
         content.addView(GatewayUi.groupHeader(this, "SIM 卡"))
         content.addView(body("SIM 身份由服务器分配。每张卡只有在这里核对卡槽并确认后才会启用；ICCID 与 IMSI 不会上传。"))
@@ -546,6 +548,14 @@ class MainActivity : AppCompatActivity() {
             trailing = GatewayUi.chevron(this), onClick = { switchTab("logs") }).apply { id = R.id.btnCfgLogs })
         return content
     }
+
+    /** The relay settings entry; [onResume] swaps in a fresh one after the page is left. */
+    private fun turnRelayTile(): View = GatewayUi.tile(this, GatewayUi.Position.SINGLE, "TURN 中继",
+        summary = com.callagent.rtcmedia.RelaySettingsActivity.summary(this),
+        icon = com.callagent.rtcmedia.R.drawable.rtc_relay_ic_relay,
+        trailing = GatewayUi.chevron(this),
+        onClick = { startActivity(Intent(this, com.callagent.rtcmedia.RelaySettingsActivity::class.java)) }
+    ).apply { id = R.id.settingsTurnRelay }
 
     private fun buildPairingForm(): LinearLayout {
         val form = LinearLayout(this).apply {
@@ -862,6 +872,11 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (SmsProviderRecovery.status(this).configured) scanSmsRecovery()
+        findViewById<View>(R.id.settingsTurnRelay)?.let { tile ->
+            val parent = tile.parent as? ViewGroup
+            val index = parent?.indexOfChild(tile) ?: -1
+            if (parent != null && index >= 0) { parent.removeViewAt(index); parent.addView(turnRelayTile(), index) }
+        }
         val filter = IntentFilter().apply {
             addAction(GatewayService.STATUS_ACTION)
             addAction(GatewayService.LOG_ACTION)

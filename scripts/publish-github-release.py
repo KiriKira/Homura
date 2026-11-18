@@ -83,7 +83,7 @@ def validate_payload(directory, commit):
 def ensure_tag(repo, tag, commit):
     reference = api(repo, f"git/ref/tags/{quote(tag, safe='')}", optional=True)
     if reference is None:
-        if tag.startswith("v"):
+        if re.fullmatch(r"v\d+\.\d+\.\d+", tag):
             raise RuntimeError("Version tag is missing; refusing to create an unsolicited stable tag")
         api(repo, "git/refs", method="POST", body={"ref": f"refs/tags/{tag}", "sha": commit})
         return
