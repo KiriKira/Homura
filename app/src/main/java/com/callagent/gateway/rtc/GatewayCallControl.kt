@@ -164,6 +164,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
         val fork=IncomingForkCoordinator(eligible.map{it.gatewayId})
         check(incomingOffers.putIfAbsent(id,fork)==null){"RTC_INCOMING_ALREADY_OFFERED"}
+        // Relay sources are prepared while hosts ring. The cache serves one
+        // owner scope at a time, so only the primary node's call is prepared.
+        (eligible.firstOrNull{it.primary}?:eligible.first()).let{RelayPrefetch.start(context,it.gatewayId,id)}
         var offered=0
         var ringWindow=INCOMING_RING_MS
         try {

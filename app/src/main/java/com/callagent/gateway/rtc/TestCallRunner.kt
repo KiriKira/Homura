@@ -161,6 +161,7 @@ class TestCallRunner(
                 return
             }
             event(call, "test_call_ringing sim=${created.optString("sim_id").take(8)} ring_window_ms=${created.optLong("remaining_ms", -1)}")
+            RelayPrefetch.start(context, call.node.gatewayId, call.callId)
             if (!await(call, (if (call.node.receptionV2) RING_MS else 25_000L) + 5_000L) { it.optString("candidate_client_id").isNotBlank() })
                 return finish(call, call.finishReason ?: "not_answered")
             val snapshot = checkNotNull(call.snapshot)
@@ -176,6 +177,7 @@ class TestCallRunner(
             }
             val authorized = admission ?: return finish(call, call.finishReason ?: "media_not_selected")
             val binding = authorized.getJSONObject("binding")
+            RelayPrefetch.learned(context, call.node.gatewayId, binding.getString("owner_id"))
             event(call, "test_call_media_admitted ice_servers=${authorized.optJSONArray("ice_servers")?.length() ?: 0}")
             val pcm = PcmBridge()
             val media = RtcAudioSession(context, authorized, call.node.api, true, pcm,

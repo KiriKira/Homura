@@ -261,6 +261,7 @@ class CallOrchestrator(
             val authorized = checkNotNull(admission) { "RTC_HOST_MEDIA_NOT_PREPARED" }
             check(authorized.getString("call_control") == "rtc")
             val binding = authorized.getJSONObject("binding")
+            com.callagent.gateway.rtc.RelayPrefetch.learned(context, leg.node.gatewayId, binding.getString("owner_id"))
             check(binding.getString("call_id") == id && binding.getString("gateway_id") == leg.node.gatewayId &&
                 binding.getString("sim_id") == snapshot.getString("sim_id") && binding.getLong("mapping_revision") == snapshot.getLong("mapping_revision")) { "RTC_MEDIA_BINDING_CHANGED" }
             val media = RtcAudioSession(context, authorized, leg.node.api, true, pcm,
