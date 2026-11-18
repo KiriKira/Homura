@@ -74,6 +74,30 @@ class NodeControlSocketTest {
         }
     }
 
+    @Test fun unlistenedSocketsCloseWhenIdleWhileWakeChannelsStay() {
+        var time=100_000_000_000L;NodeControlSocket.clock={time}
+        MockWebServer().use{server->
+            repeat(2){server.enqueue(MockResponse().withWebSocketUpgrade(object:WebSocketListener(){
+                override fun onMessage(ws:WebSocket,text:String){val r=JSONObject(text);ws.send(JSONObject().put("version",1).put("request_id",r.getString("request_id")).put("status",200).put("body",JSONObject()).toString())}
+            }))}
+            val base=server.url("/").toString().trimEnd('/');NodeControlSocket.observed(base,setOf("rtc_control_ws_v1"))
+            assertNotNull(NodeControlSocket.request(base,"token","POST","/rtc/control/capability",JSONObject()))
+            assertEquals(1,NodeControlSocket.openLinks())
+            time+=NodeControlSocket.IDLE_CLOSE_NS-1;NodeControlSocket.sweepIdle()
+            assertEquals("still in use",1,NodeControlSocket.openLinks())
+            // The active node's wake channel is kept however long it is quiet.
+            NodeControlSocket.listen(base,"wake"){}
+            time+=NodeControlSocket.IDLE_CLOSE_NS;NodeControlSocket.sweepIdle()
+            assertEquals(1,NodeControlSocket.openLinks())
+            // A standby node probed now and then does not keep one between probes.
+            NodeControlSocket.unlisten("wake");NodeControlSocket.sweepIdle()
+            assertEquals(0,NodeControlSocket.openLinks())
+            // An idle close is not a failure: the next request reconnects at once.
+            assertNotNull(NodeControlSocket.request(base,"token","POST","/rtc/control/capability",JSONObject()))
+            assertEquals(2,server.requestCount)
+        }
+    }
+
     @Test fun connectionAdmissionLimitAllowsHttpLeaseFallback() {
         MockWebServer().use{server->
             server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After","30").setBody("""{"error":{"code":"CONTROL_CONNECTION_LIMIT"}}"""))

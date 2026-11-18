@@ -15,6 +15,22 @@ object NodeControlSocket {
     private data class Retry(var delay:Long=1000,var until:Long=0)
     private val retries=ConcurrentHashMap<String,Retry>()
     private val links=ConcurrentHashMap<String,Link>()
+    /** A socket nothing listens on closes after this long unused: a standby
+     * node probed every few minutes must not keep one open (and pinging every
+     * 25 s) between probes. A listened node keeps its socket: it is a wake channel. */
+    internal const val IDLE_CLOSE_NS=45_000_000_000L
+    private val sweeper=Executors.newSingleThreadScheduledExecutor{Thread(it,"NodeControlSocket-Idle").apply{isDaemon=true}}
+    private val sweepScheduled=java.util.concurrent.atomic.AtomicBoolean()
+    private fun scheduleSweep(){
+        if(sweepScheduled.compareAndSet(false,true))runCatching{sweeper.schedule({sweepScheduled.set(false);sweepIdle()},IDLE_CLOSE_NS/1_000_000+1000,TimeUnit.MILLISECONDS)}.onFailure{sweepScheduled.set(false)}
+    }
+    /** Closes unlistened sockets idle for [IDLE_CLOSE_NS]; reschedules while any stay open. */
+    internal fun sweepIdle(){
+        val listened=listeners.values.map{it.first}.toSet()
+        links.forEach{(key,link)->if(key !in listened&&link.idleFor()>=IDLE_CLOSE_NS&&links.remove(key,link))link.close()}
+        if(links.isNotEmpty())scheduleSweep()
+    }
+    internal fun openLinks()=links.size
     private val listeners=ConcurrentHashMap<String,Pair<String,()->Unit>>()
     fun listen(base:String,owner:String,wake:()->Unit){listeners[owner]=root(base) to wake}
     fun unlisten(owner:String){listeners.remove(owner)}
@@ -38,6 +54,7 @@ object NodeControlSocket {
         val identity=MessageDigest.getInstance("SHA-256").digest(token.toByteArray()).joinToString(""){"%02x".format(it)}
         if(links.size>8){links.values.forEach{it.close()};links.clear()}
         val link=links.compute(key){_,old->if(old?.identity==identity)old else {old?.close();Link(key,token,identity)}}!!
+        scheduleSweep()
         return try{link.request(method,path,body,timeoutMs.coerceIn(1,6000),idempotencyKey).also{if(link.stable())retries.remove(key)}}catch(failure:MediaApiException){
             if(failure.status in setOf(404,426)&&failure.code=="CONTROL_SOCKET_UNAVAILABLE")features.computeIfPresent(key){_,old->old-setOf("rtc_control_ws_v1","cold_standby_v1","client_ping_v1")}
             if(failure.status>=500 || (failure.status in setOf(404,426)&&failure.code=="CONTROL_SOCKET_UNAVAILABLE")){failed(key,link);null}
@@ -56,6 +73,9 @@ object NodeControlSocket {
         @Volatile private var snapshotAt=0L
         @Volatile private var lastLeaseReadAt=0L
         fun isLive()=live
+        @Volatile private var lastUsed=now()
+        /** Unused time; never idle while a request waits for its answer. */
+        fun idleFor()=if(pending.isNotEmpty())0L else now()-lastUsed
         private val paths=ConcurrentHashMap<String,String>()
         private val idle=ConcurrentHashMap<String,JSONObject>()
         private val epoch=java.util.concurrent.atomic.AtomicLong()
@@ -104,6 +124,10 @@ object NodeControlSocket {
             })
         }
         fun request(method:String,path:String,body:JSONObject?,timeout:Long,idempotencyKey:String?):JSONObject {
+            lastUsed=now()
+            try{return exchange(method,path,body,timeout,idempotencyKey)}finally{lastUsed=now()}
+        }
+        private fun exchange(method:String,path:String,body:JSONObject?,timeout:Long,idempotencyKey:String?):JSONObject {
             if(method=="GET"&&live)idle[path]?.let{return JSONObject(it.toString())}
             if(method!="GET"){epoch.incrementAndGet();idle.clear()}
             val requestEpoch=epoch.get()
