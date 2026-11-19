@@ -43,7 +43,6 @@
 ```
 
 - **产物：** 调试包在 `app/build/outputs/apk/debug/app-debug.apk`；`./build.sh` 额外打出 Magisk 模块（`gateway-magisk.zip`）。
-- **正式版（GitHub Actions）：** 推送 `main` 发布预览版，打 `v*` 标签发布正式版，产出 `Homura.apk` 与 `Homura-Magisk.zip`。fork 后先运行 `python3 scripts/configure-release-signing.py --repo <你的仓库>`，写入 `GSM_RELEASE_*` 签名 secrets 与 `GSM_RELEASE_CERT_SHA256` 变量，详见 [docs/releases.md](docs/releases.md)。
 - **别用卸载重装解决签名冲突：** 会丢掉本机未决的发送账本。所有正式版共用同一 versionCode，可直接覆盖升级或回退。
 
 更多文档：[Magisk 适配说明](docs/magisk-runtime.md) · [设备验收状态](docs/devices.md) · [多节点配置](docs/mesh.md) · [短信备份与归档](docs/sms-backup.md) · [界面与后台说明](docs/android-ui-and-background.md)
