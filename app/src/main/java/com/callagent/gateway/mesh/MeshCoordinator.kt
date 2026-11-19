@@ -120,7 +120,7 @@ class MeshCoordinator(
         val proposed = client.proposeSimBindings(operationId, proposal)
         val expected = confirmed.map { it.simId.lowercase() }.toSet()
         if (proposed.mappings.map { it.simId.lowercase() }.toSet() != expected) {
-            throw ControlApiException("MESH_SIM_ID_MISMATCH", "节点未保留旧手机提议的 SIM ID")
+            throw ControlApiException("MESH_SIM_ID_MISMATCH", "节点未保留 SIM 网关提议的 SIM ID")
         }
         val confirmations = JSONArray()
         proposed.mappings.forEach { mapping ->
