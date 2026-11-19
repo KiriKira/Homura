@@ -500,7 +500,7 @@ class MainActivity : AppCompatActivity() {
         val mesh = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         content.addView(mesh)
         meshNodesSection = MeshNodesSection(this, mesh,
-            deviceName = { controlDeviceName.text.toString().trim().ifEmpty { Build.MODEL ?: "旧手机网关" } },
+            deviceName = { controlDeviceName.text.toString().trim().ifEmpty { Build.MODEL ?: "SIM 网关" } },
             onChanged = { GatewayService.startControl(this) })
 
         content.addView(GatewayUi.groupHeader(this, "TURN 中继"))
@@ -542,7 +542,7 @@ class MainActivity : AppCompatActivity() {
 
         content.addView(GatewayUi.groupHeader(this, "关于"))
         content.addView(GatewayUi.tile(this, GatewayUi.Position.FIRST, "Homura",
-            summary = "旧手机网关 · v${BuildConfig.VERSION_NAME}", icon = R.drawable.ic_ui_info))
+            summary = "SIM 网关 · v${BuildConfig.VERSION_NAME}", icon = R.drawable.ic_ui_info))
         content.addView(GatewayUi.tile(this, GatewayUi.Position.LAST, "运行日志",
             summary = "网关、通话与同步的最近事件", icon = R.drawable.ic_ui_logs,
             trailing = GatewayUi.chevron(this), onClick = { switchTab("logs") }).apply { id = R.id.btnCfgLogs })
@@ -564,7 +564,7 @@ class MainActivity : AppCompatActivity() {
             background = GatewayUi.tileBackground(this@MainActivity, GatewayUi.Position.SINGLE)
             layoutParams = GatewayUi.tileParams(this@MainActivity, GatewayUi.Position.SINGLE)
         }
-        form.addView(body("在服务器上为这台旧手机生成一次性 gateway 配对码，再填写服务器地址完成配对。", selectable = false))
+        form.addView(body("在服务器上为这台 SIM 网关生成一次性 gateway 配对码，再填写服务器地址完成配对。", selectable = false))
         val urlField = inputField("服务器地址（http:// 或 https://）", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         controlUrl = (urlField.editText as TextInputEditText).apply {
             id = R.id.etControlUrl
@@ -1864,7 +1864,7 @@ class MainActivity : AppCompatActivity() {
             prefs.getString("control_base_url", "").orEmpty().takeIf { it.isNotEmpty() }?.let { controlUrl.setText(it) }
             controlStatus.text = UNPAIRED_STATUS
         }
-        controlDeviceName.setText(prefs.getString("control_device_name", Build.MODEL ?: "旧手机"))
+        controlDeviceName.setText(prefs.getString("control_device_name", Build.MODEL ?: "SIM 网关"))
         renderPairedSummary()
     }
 
@@ -1926,7 +1926,7 @@ class MainActivity : AppCompatActivity() {
     private fun pairControlGateway(onPaired: (() -> Unit)? = null) {
         val base = controlUrl.text.toString().trim()
         val code = controlPairingCode.text.toString().trim()
-        val deviceName = controlDeviceName.text.toString().trim().ifEmpty { Build.MODEL ?: "旧手机网关" }
+        val deviceName = controlDeviceName.text.toString().trim().ifEmpty { Build.MODEL ?: "SIM 网关" }
         if (base.isEmpty() || code.isEmpty()) {
             Toast.makeText(this, "请填写服务器地址（http:// 或 https://）和一次性配对码", Toast.LENGTH_LONG).show()
             return

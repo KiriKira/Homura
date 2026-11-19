@@ -113,7 +113,7 @@ class MeshNodesSection(
     private fun confirmRemove(node: GatewayDatabase.MeshNode) {
         MaterialAlertDialogBuilder(activity)
             .setTitle("移除节点 ${node.label}？")
-            .setMessage("旧手机将不再向该节点上报短信或接受其命令。尚未上传到该节点的短信不会转给其他节点。")
+            .setMessage("SIM 网关将不再向该节点上报短信或接受其命令。尚未上传到该节点的短信不会转给其他节点。")
             .setNegativeButton("取消", null)
             .setPositiveButton("移除") { _, _ ->
                 Thread({
