@@ -1,52 +1,56 @@
-# Homura：旧手机双 SIM 网关
+<p align="center">
+  <img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.webp" width="112" alt="Homura">
+</p>
+<h1 align="center">Homura</h1>
+<p align="center"><b>让插着 SIM 卡的备用机，安安静静地把电话和短信转发出去。</b></p>
+<p align="center">
+  <a href="https://github.com/KiriKira/Homura/releases">下载 APK</a> ·
+  <a href="#-初次连接">快速连接</a> ·
+  <a href="#-两种模式按需开启">短信 vs 通话模式</a> ·
+  <a href="docs/">文档</a>
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Android%20(API%2026%2B)-3DDC84?style=flat-square&logo=android&logoColor=white" alt="Android">
+  <img src="https://img.shields.io/badge/SMS-No%20Root%20Needed-success?style=flat-square" alt="SMS">
+  <img src="https://img.shields.io/badge/Voice-WebRTC%20%2B%20Magisk-blue?style=flat-square" alt="Voice">
+  <img src="https://img.shields.io/badge/Version-1.0.1-ff69b4?style=flat-square" alt="Version">
+</p>
 
-Homura 是三端系统中的旧手机网关：旧 Android 保留两张 SIM，未 root 的主手机 [Madoka](https://github.com/KiriKira/gsm2sip-client-android) 经自建服务器 [SoulGem](https://github.com/KiriKira/gsm2sip-server) 收发短信、接打电话。
+**Homura** 装在插有实体 SIM 卡的备用机上。它负责守住移动网络，把收到的短信和来电通过自建服务端（[SoulGem](https://github.com/KiriKira/SoulGem) / [GriefSeed](https://github.com/KiriKira/GriefSeed)）实时转给你的主力手机 [Madoka](https://github.com/KiriKira/Madoka)，并代为发短信或拨打电话。
 
-0.4.0 起通话只走服务器 HTTPS 呼叫控制与原生 WebRTC 音频，SIP、RTP/SRTP、STUN 与 Asterisk 已全部移除；界面改为与 Madoka 相同的样式（状态 / 记录 / 设置三页，运行日志在设置中）。包名 `com.callagent.gateway` 不变，所有正式版共用 versionCode `1000000000`，可直接覆盖升级或回退到任一更早的正式版，见 [发布与回退](docs/releases.md)。三端升级顺序、回退步骤与联合测试计划见服务器仓库的 [0.4 发布说明](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/release-0.4.md) 与 [联合测试计划](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/plan-0.4-joint-test.md)。
+## ✨ 两种模式，按需开启
 
-- 短信：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执；可选系统库补收。不确定发送保留 `unknown`，不会自动重发或回落默认 SIM。
-- 通话（需 root/Magisk）：来电同时经各服务器节点向主手机振铃、先接者胜出；去电由主手机发起、本机只拨一次。蜂窝音频经 Magisk broker 采集与注入，通过 WebRTC 与主手机互通。
-- [多节点](docs/mesh.md)：可同时连接多台独立服务器，每条短信送到所有节点；同一条短信或同一通去电只执行一次。
-- [短信备份与归档](docs/sms-backup.md)：密码加密备份、JSON 与 SMS Backup & Restore XML 导出/导入。
+- **纯短信模式（无需 Root）：** 直接安装普通 APK 即可使用。只申请电话状态与收发短信权限，不碰录音、拨号角色或 Root；每条短信严格按指定 SIM 卡槽发送，绝不擅自回落默认卡或重复乱发。
+- **远程通话模式（需 Root / Magisk）：** 全面采用原生 WebRTC 音频，彻底告别 SIP 与 Asterisk。通过 Magisk 权限与受限 system-UID broker 采集/注入蜂窝通话音频，把清晰的语音直接桥接到主力机。
+- **多服务器同时在线：** 可同时连接多台独立服务端节点；同一条待发短信或去电无论从哪个节点进来，本地账本都会确保只执行一次。
+- **开箱即用的三栏界面：** 采用与 Madoka 一致的「状态 / 记录 / 设置」界面，引导式完成配对、逐卡核对 SIM、权限检查与备份导出（支持密码加密、JSON 与 XML）。
 
-更多资料：[界面与后台运行](docs/android-ui-and-background.md)、[实施状态](docs/implementation-state.md)、[设备验收状态](docs/devices.md)、[Magisk 适配](docs/magisk-runtime.md)、[Android 虚拟机使用指南](docs/android-virtual-machine.md)、[自动构建与固定签名](docs/releases.md)。
+## 🚀 初次连接
 
-测试通话播放的音乐为 muque「いいんじゃない」（`app/src/main/res/raw/test_call_music.m4a`），仅用于测试通话；版权归原作者所有。
+1. **安装网关端：** 从 [Releases](https://github.com/KiriKira/Homura/releases) 下载安装（正式版共用固定签名与 versionCode，支持随时覆盖升级或回退）。
+2. **配对服务器：** 打开「状态」页的引导卡片，在「设置 → 服务器与配对」中填入服务器地址和 `gateway` 角色的一次性配对码（内网或 Tailscale 可用 `http://`）。
+3. **核对 SIM 卡槽：** 进入「设置 → SIM 卡」点击「同步 SIM 列表」，逐张确认本机卡槽与服务端记录对应后保存。
+4. **开启后台保活：** 在「设置 → 后台运行与权限」打开后台服务并允许通知；如需长期熄屏稳定收发，建议豁免电池优化。
+5. **（可选）开启通话：** 如需接打电话，在「状态」页点击远程通话的「诊断并启动」，按提示完成默认电话应用与音频路径检查即可。
 
-## 短信模式无需 root
+<details>
+<summary>🔧 本地构建、文档与鸣谢</summary>
 
-只收发短信可直接安装普通 APK；启动只申请 `READ_PHONE_STATE`、`SEND_SMS`、
-`RECEIVE_SMS`，不申请录音、拨号、默认电话角色，也不初始化 su 或 Magisk broker。
-开启后台后按需允许通知与电池优化豁免。语音权限和 root 探测仅在显式运行设备诊断并启动语音时使用。
-Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS 时会报告功能不可用，
-不会通过 root 静默授权。普通权限无法取得稳定 SIM 身份时需要本机逐卡确认，重启后重新核对；不会回落默认卡。
-
-## 开发与初次连接
-
-需要 JDK 17+、Android SDK 35；本机调试 APK：
+需要 JDK 17+ 与 Android SDK 35（包名 `com.callagent.gateway`）：
 
 ```bash
 ./gradlew :app:assembleDebug :app:testDebugUnitTest
 ```
 
-产物为 `app/build/outputs/apk/debug/app-debug.apk`。没有发布签名的 release 不能直接打包。
-不要用卸载重装解决签名冲突而丢弃未决发送账本。
+- [Magisk 适配说明](docs/magisk-runtime.md) · [设备验收状态](docs/devices.md) · [多节点配置](docs/mesh.md)
+- [短信备份与归档](docs/sms-backup.md) · [界面与后台说明](docs/android-ui-and-background.md) · [发布与回退](docs/releases.md)
+- 测试通话内嵌音频为 muque「いいんじゃない」（`app/src/main/res/raw/test_call_music.m4a`），仅用于测试，版权归原作者所有。
 
-1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；推荐按服务器 README 配置可信 HTTPS。
-   家庭局域网或 Tailscale 内的节点也可直接用 `http://` 地址（唤醒连接随之为 `ws://`）。
-2. 打开“状态”页的“完成设置”，按顺序完成每一步；每一步会直接跳到对应设置项：
-   在“设置 → 服务器与配对”中填写服务器地址、设备名称和一次性配对码，点击“配对网关”。
-3. 在“设置 → SIM 卡”中点击“同步 SIM 列表”，逐卡核对本机订阅与服务器 SIM 行，再点击“确认所选 SIM”。
-4. 在“设置 → 后台运行与权限”中启用后台运行并允许通知；需要持续熄屏运行时豁免电池优化。
-5. 需要远程通话时，点击“状态”页“远程通话”的“诊断并启动”：确认默认电话角色、语音权限与音频采集后再启动语音。
-6. 主手机 Madoka 使用同一 owner 的 client 配对码连接，即可收发短信、接打电话。
-
-健康 WSS 连接收到提示后同步，断开时约每 30 秒补齐；失败会退避到最长 5 分钟。服务器接收任务不代表 modem 已发送，
-`submitted` 不代表对方已收到。构建最低 Android API 26。语音按实际 Telephony/Telecom 能力精确映射，公开接口不足时通过 Magisk 的受限 system-UID broker 查询；缺失或不唯一时报告不可用。
+</details>
 
 ## 原上游历史说明
 
-下面保留原项目的设备经验和旧 SIP 使用说明，仅供音频移植研究。Homura 已不含任何 SIP 代码，
+下面保留原项目 [pulpoff/gsm2sip](https://github.com/pulpoff/gsm2sip) 的设备经验和旧 SIP 使用说明，仅供音频移植研究。Homura 已不含任何 SIP 代码，
 旧 Callagent/chan_sip 部署、SIP MESSAGE 发短信、启动时强制录音授权等描述均不适用。
 上游发布 APK 也不包含本批修改。
 
