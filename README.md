@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.webp" width="112" alt="Homura">
+  <img src="icon.png" width="112" alt="Homura">
 </p>
 <h1 align="center">Homura</h1>
 <p align="center"><b>让插着 SIM 卡的备用机，安安静静地把电话和短信转发出去。</b></p>
